@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# restore_command = '/usr/local/bin/pgbr-archive-get [--strict] %f %p'
+#
+# Exit codes matter here:
+#   0    file restored
+#   1    file is not in the archive. PostgreSQL treats this as "end of archived WAL".
+#   200  (--strict only) the archive could not be reached. PostgreSQL aborts recovery (exit > 125).
+#
+# Normal mode is for Patroni replicas: an unreachable repository must never stop a standby from
+# starting, so every failure is reported as "not found" and the replica falls back to streaming.
+# --strict is for point-in-time recovery: there, mistaking "repository unreachable" for "end of WAL"
+# would silently finish recovery too early and promote a database that is missing transactions.
+. /usr/local/lib/pgbr/node-lib.sh
+
+strict=0
+if [[ ${1:-} == --strict ]]; then strict=1; shift; fi
+name=${1:?usage: pgbr-archive-get [--strict] %f %p}
+dest=${2:?usage: pgbr-archive-get [--strict] %f %p}
+
+tmp="$dest.pgbr-tmp.$$"
+trap 'rm -f "$tmp"' EXIT
+
+attempts=1
+(( strict )) && attempts=${PGBR_GET_RETRIES:-10}
+rc=0
+for (( i = 1; i <= attempts; i++ )); do
+  rc=0
+  repo_ssh wal-get "$name" >"$tmp" 2>/dev/null || rc=$?
+  case $rc in
+    0)  mv "$tmp" "$dest"; exit 0;;
+    44) exit 1;;
+  esac
+  (( i < attempts )) && sleep "${PGBR_GET_RETRY_SLEEP:-6}"
+done
+
+if (( strict )); then
+  nlog "repository unreachable while fetching $name (rc=$rc): aborting recovery instead of ending it early"
+  exit 200
+fi
+exit 1

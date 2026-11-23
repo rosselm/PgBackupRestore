@@ -1,0 +1,9 @@
+[Unit]
+Description=Weekly pgbr re-verification of stored backups of cluster %i
+
+[Timer]
+OnCalendar=Sat *-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

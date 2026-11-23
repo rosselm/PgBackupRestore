@@ -1,0 +1,8 @@
+[Unit]
+Description=pgbr: push ancestor-timeline WAL that is still in pg_wal but missing from the archive
+After=patroni.service
+
+[Service]
+Type=oneshot
+User=postgres
+ExecStart=/bin/sh -c '/usr/local/bin/pgbr-wal-backfill >>/var/log/pgbr/backfill.log 2>&1'

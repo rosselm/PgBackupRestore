@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Runs on the Mac. Enables the scheduled jobs on the backup host and runs each unit once so a
+# broken unit shows up now rather than at 01:15.
+set -euo pipefail
+cd "$(dirname "$0")"
+source ./lab.env
+
+orb -m "$BACKUP_HOST" sudo bash -c "
+set -e
+for t in backup check verify restore-test; do
+  systemctl enable --now pgbr-\$t@$CLUSTER_NAME.timer >/dev/null 2>&1
+done
+echo '== first run of each unit'
+for s in backup check; do
+  systemctl start pgbr-\$s@$CLUSTER_NAME.service && echo \"pgbr-\$s@$CLUSTER_NAME.service: \$(systemctl show -p Result --value pgbr-\$s@$CLUSTER_NAME.service)\"
+done
+echo
+journalctl -u pgbr-backup@$CLUSTER_NAME.service -u pgbr-check@$CLUSTER_NAME.service --no-pager -n 14 -o cat
+echo
+systemctl list-timers 'pgbr-*' --no-pager
+"

@@ -1,0 +1,38 @@
+# pgbr repository-side configuration for one cluster: /etc/pgbr/<cluster>.conf
+# (shell syntax, sourced by /usr/local/bin/pgbr)
+
+PGBR_CLUSTER=pglab                         # must match the file name and the Patroni scope
+PGBR_REPO=/srv/pgbackup/pglab              # wal/ base/ state/ log/ scratch/ live here
+PGBR_PGBIN=/usr/lib/postgresql/17/bin      # same major version as the cluster
+
+# How the cluster is found. Any one reachable endpoint is enough; list them all.
+PGBR_PATRONI_ENDPOINTS="http://pg1:8008 http://pg2:8008 http://pg3:8008"
+PGBR_PGUSER=backup                         # REPLICATION + pg_monitor + pg_checkpoint; password in ~/.pgpass
+
+# --- where base backups are taken ---
+PGBR_BACKUP_FROM=prefer-replica            # replica | prefer-replica | primary
+PGBR_MAX_REPLICA_LAG_BYTES=67108864        # replicas lagging more than this are not used
+#PGBR_MAX_RATE=100M                        # pg_basebackup --max-rate, to protect the source's I/O
+PGBR_MANIFEST_CHECKSUMS=SHA256             # CRC32C is cheaper, SHA256 also detects tampering
+
+# --- full / incremental policy ("backup --type auto") ---
+PGBR_INCREMENTAL=1                         # 0 = always full (required before PostgreSQL 17)
+PGBR_FULL_INTERVAL_DAYS=7                  # a new full once the newest full is this old
+PGBR_INCR_FALLBACK_FULL=1                  # if an incremental cannot be taken, take a full instead
+PGBR_INCR_PRIMARY_CHECKPOINT=1             # CHECKPOINT on the primary before an incremental from a replica
+
+# --- retention ---
+PGBR_RETENTION_DAYS=7                      # PITR window: any moment in the last N days stays restorable
+PGBR_KEEP_FULL_MIN=2                       # never keep fewer full backups than this
+
+# --- monitoring thresholds (pgbr check) ---
+PGBR_MAX_BACKUP_AGE_HOURS=26
+PGBR_MAX_ARCHIVE_AGE_SECONDS=600           # > archive_timeout, with margin
+PGBR_MAX_RESTORE_TEST_AGE_DAYS=8
+#PGBR_ALERT_CMD="mail -s"                  # called as: <cmd> "<subject>"  with the details on stdin
+
+# --- side restores / restore tests on this host ---
+PGBR_RESTORE_PORT=5499
+PGBR_RESTORE_SHARED_BUFFERS=256MB
+#PGBR_RESTORE_EXTRA_CONF=/etc/pgbr/restore-extra.conf   # e.g. shared_preload_libraries the WAL needs
+#PGBR_RESTORE_TEST_SQL="select now() - max(ts) from heartbeat"

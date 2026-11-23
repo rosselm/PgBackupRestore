@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# archive_command = '/usr/local/bin/pgbr-archive-push %p %f'
+#
+# Ships one WAL file to the repository. The repository side verifies size + SHA-256, stores it
+# atomically, treats a byte-identical re-push as success and refuses a different file under the
+# same name. Any failure returns non-zero so PostgreSQL keeps the segment and retries.
+. /usr/local/lib/pgbr/node-lib.sh
+
+path=${1:?usage: pgbr-archive-push %p %f}
+name=${2:?usage: pgbr-archive-push %p %f}
+[[ -f $path ]] || { nlog "$path does not exist"; exit 1; }
+
+sum=$(sha256sum <"$path"); sum=${sum%% *}
+size=$(stat -c %s "$path")
+
+if ! err=$(repo_ssh wal-push "$name" "$sum" "$size" <"$path" 2>&1); then
+  nlog "FAILED to archive $name: ${err:-ssh error}"
+  exit 1
+fi
+exit 0

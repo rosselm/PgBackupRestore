@@ -1,0 +1,9 @@
+[Unit]
+Description=pgbr re-verification of all stored backups of cluster %i (pg_verifybackup)
+
+[Service]
+Type=oneshot
+User=postgres
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/local/bin/pgbr -c %i verify --all

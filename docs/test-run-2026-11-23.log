@@ -1,0 +1,419 @@
+
+ 01-pitr-side-restore.sh 
+
+== Create a table that matters, then note the last good moment
+   last good moment: 2026-11-23T14:51:35.618785+00:00
+
+== The accident: DROP TABLE orders (and life goes on for a few seconds)
+   heartbeat rows at the good moment: 1574, now: 1583
+
+== Restore to 2026-11-23T14:51:35.618785+00:00 in a side instance on pgbackup
+2026-11-23T14:51:44Z [28072] restore: backup 20261123T144419I -> /srv/pgbackup/pglab/scratch/pitr-side (target: recovery_target_time = '2026-11-23T14:51:35.618785+00:00', timeline latest, action promote)
+2026-11-23T14:51:44Z [28072] restore: materialising 20261123T144419I from chain: 20261123T144330F 20261123T144346I 20261123T144419I
+waiting for server to start.... done
+server started
+2026-11-23T14:51:47Z [28072] restore: instance is up on port 5441 (socket /var/run/postgresql): promoted, timeline 13, last replayed commit 2026-11-23 14:51:34.659146+00
+20261123T144419I
+
+== Check what the side instance contains
+   PASS orders table is back with all rows (1000)
+   PASS heartbeat rows match the target moment exactly (1574)
+   PASS nothing after the target was replayed (0)
+   PASS side instance cannot write into the real WAL archive (off)
+   PASS production is untouched (table still dropped there) (t)
+
+== Bring the table back into production from the side instance (pg_dump | psql)
+   PASS orders restored in production (1000)
+
+== Scenario 1 passed
+
+ 02-failover-wal-gap.sh 
+
+== Start: leader is pg2, newest backup is 20261123T144419I
++ Cluster: pglab (7711370960295306399) ----+-------------+-----+------------+-----+
+| Member | Host | Role    | State     | TL | Receive LSN | Lag | Replay LSN | Lag |
++--------+------+---------+-----------+----+-------------+-----+------------+-----+
+| pg1    | pg1  | Replica | streaming | 12 |  0/43030898 |  16 | 0/43030898 |  16 |
+| pg2    | pg2  | Leader  | running   | 12 |             |     |            |     |
+| pg3    | pg3  | Replica | streaming | 12 |  0/43030898 |  16 | 0/43030898 |  16 |
++--------+------+---------+-----------+----+-------------+-----+------------+-----+
+
+== Break archiving on pg2 only (its repository key disappears), then keep writing
+   archiver on pg2: last archived 0000000C0000000000000044, failing on 0000000C0000000000000045, waiting=4
+   PASS 4 completed segments exist only on the nodes, not in the archive: 0000000C0000000000000045 0000000C0000000000000046 0000000C0000000000000047 0000000C0000000000000048
+
+== Kill pg2 hard (SIGKILL Patroni + PostgreSQL, then power off the VM)
+   PASS failover: pg1 holds the leader lock
+   PASS pg1 is writable (about 14s after taking the lock) (f)
++ Cluster: pglab (7711370960295306399) ----+-------------+-----+------------+-----+
+| Member | Host | Role    | State     | TL | Receive LSN | Lag | Replay LSN | Lag |
++--------+------+---------+-----------+----+-------------+-----+------------+-----+
+| pg1    | pg1  | Leader  | running   | 13 |             |     |            |     |
+| pg3    | pg3  | Replica | streaming | 13 |  0/490002B8 |   0 | 0/490002B8 |   0 |
++--------+------+---------+-----------+----+-------------+-----+------------+-----+
+
+== Promotion hook on pg1: every stranded segment must reach the archive
+   PASS all 4 stranded segments are now in the archive
+   PASS they were pushed by the backfill on pg1
+   2026-11-23T14:53:01Z [pgbr-wal-backfill] backfilled 0000000C0000000000000045
+   2026-11-23T14:53:01Z [pgbr-wal-backfill] backfilled 0000000C0000000000000046
+   2026-11-23T14:53:02Z [pgbr-wal-backfill] backfilled 0000000C0000000000000047
+   2026-11-23T14:53:02Z [pgbr-wal-backfill] backfilled 0000000C0000000000000048
+
+== Repository health across the timeline switch
+OK    patroni: leader=pg1 timeline=13 members=pg1:leader:running,pg3:replica:streaming
+OK    backup: newest is 20261123T144419I (incr from pg1), 8min old; 6 usable backup(s)
+OK    timeline: backups only restorable with an explicit older --target-timeline: 20261123T143900I 
+OK    wal: continuous from backup 20261123T143813F to the newest archived segment on timeline 13
+OK    wal: last segment archived 1s ago (0000000D000000000000004A.zst)
+OK    archiver: healthy on the leader (0 waiting, 0 failures since stats reset)
+OK    restore-test: last success 0h ago (backup 20261123T144346I)
+   PASS WAL archive is continuous from the oldest backup through the failover
+
+== Backup after the failover (must come from the remaining replica, on the new timeline)
+2026-11-23T14:53:13Z [29460] backup 20261123T145313I: type=incr parent=20261123T144419I source=pg3 (replica) pg3:5432
+2026-11-23T14:53:14Z [29460] backup 20261123T145313I: verifying with pg_verifybackup
+2026-11-23T14:53:14Z [29460] backup 20261123T145313I: OK (incr from pg3, timeline 13, 0/4B0000F0..0/4B002048, 20 MiB)
+ID                TYPE  PARENT            STATUS  SOURCE   TLI  START_LSN    STOP_LSN     STOP_TIME                   SIZE_MIB
+20261123T143813F  full  -                 ok      pg2      7    0/290000D8   0/2A000D48   2026-11-23T14:38:14+00:00         62
+20261123T143900I  incr  20261123T143813F  ok      pg2      7    0/2B0220B0   0/2B022180   2026-11-23T14:39:01+00:00         20
+20261123T144034F  full  -                 ok      pg2      9    0/2C0000D8   0/2D000D48   2026-11-23T14:40:35+00:00         62
+20261123T144330F  full  -                 ok      pg2      11   0/330000D8   0/330048A8   2026-11-23T14:43:31+00:00         46
+20261123T144346I  incr  20261123T144330F  ok      pg2      11   0/35000BB8   0/35000C88   2026-11-23T14:43:47+00:00         20
+20261123T144419I  incr  20261123T144346I  ok      pg1      11   0/37000028   0/37000120   2026-11-23T14:44:20+00:00         20
+20261123T145313I  incr  20261123T144419I  ok      pg3      13   0/4B0000F0   0/4B002048   2026-11-23T14:53:14+00:00         20
+   PASS backup 20261123T145313I taken from pg3 tli=13
+
+== PITR 1/3: a moment BEFORE the failover
+   2026-11-23T14:53:15Z [30052] restore: backup 20261123T144419I -> /srv/pgbackup/pglab/scratch/pitr-failover (target: recovery_target_time = '2026-11-23T14:51:50.992146+00:00', timeline latest, action promote)
+   2026-11-23T14:53:18Z [30052] restore: instance is up on port 5442 (socket /var/run/postgresql): promoted, timeline 14, last replayed commit 2026-11-23 14:51:50.180915+00
+   PASS before failover (2026-11-23T14:51:50.992146+00:00): heartbeat rows (1589)
+   rows per timeline in the restored instance: tli 1: 202, tli 2: 330, tli 3: 67, tli 4: 125, tli 5: 125, tli 7: 108, tli 9: 192, tli 11: 372, tli 12: 68
+
+== PITR 2/3: a moment whose WAL the dead primary never archived (only reachable through the backfill)
+   2026-11-23T14:53:19Z [30608] restore: backup 20261123T144419I -> /srv/pgbackup/pglab/scratch/pitr-failover (target: recovery_target_time = '2026-11-23T14:52:05.726521+00:00', timeline latest, action promote)
+   2026-11-23T14:53:22Z [30608] restore: instance is up on port 5442 (socket /var/run/postgresql): promoted, timeline 14, last replayed commit 2026-11-23 14:52:04.772117+00
+   PASS inside the unarchived window (2026-11-23T14:52:05.726521+00:00): heartbeat rows (1603)
+   rows per timeline in the restored instance: tli 1: 202, tli 2: 330, tli 3: 67, tli 4: 125, tli 5: 125, tli 7: 108, tli 9: 192, tli 11: 372, tli 12: 82
+
+== PITR 3/3: a moment AFTER the failover, starting from the pre-failover backup (crosses timeline 1 -> 2)
+   2026-11-23T14:53:22Z [30923] restore: backup 20261123T144419I -> /srv/pgbackup/pglab/scratch/pitr-failover (target: recovery_target_time = '2026-11-23T14:53:09.424652+00:00', timeline latest, action promote)
+   2026-11-23T14:53:25Z [30923] restore: instance is up on port 5442 (socket /var/run/postgresql): promoted, timeline 14, last replayed commit 2026-11-23 14:53:09.079194+00
+   PASS after failover (2026-11-23T14:53:09.424652+00:00): heartbeat rows (1616)
+   rows per timeline in the restored instance: tli 1: 202, tli 2: 330, tli 3: 67, tli 4: 125, tli 5: 125, tli 7: 108, tli 9: 192, tli 11: 372, tli 12: 87, tli 13: 8
+
+== Bring pg2 back: Patroni rejoins it as a replica
+   PASS cluster is back to 1 primary + 2 streaming replicas
++ Cluster: pglab (7711370960295306399) ----+-------------+-----+------------+-----+
+| Member | Host | Role    | State     | TL | Receive LSN | Lag | Replay LSN | Lag |
++--------+------+---------+-----------+----+-------------+-----+------------+-----+
+| pg1    | pg1  | Leader  | running   | 13 |             |     |            |     |
+| pg2    | pg2  | Replica | streaming | 13 |  0/4C01C288 |   0 | 0/4C01C288 |   0 |
+| pg3    | pg3  | Replica | streaming | 13 |  0/4C01BCC0 |   0 | 0/4C01BCC0 |   0 |
++--------+------+---------+-----------+----+-------------+-----+------------+-----+
+
+== Scenario 2 passed
+
+ 03-backup-during-switchover.sh 
+
+== Start a deliberately slow full backup (512 kB/s) in the background
++ Cluster: pglab (7711370960295306399) ----+-------------+-----+------------+-----+
+| Member | Host | Role    | State     | TL | Receive LSN | Lag | Replay LSN | Lag |
++--------+------+---------+-----------+----+-------------+-----+------------+-----+
+| pg1    | pg1  | Leader  | running   | 13 |             |     |            |     |
+| pg2    | pg2  | Replica | streaming | 13 |  0/4C01DDB0 |   0 | 0/4C01DDB0 |   0 |
+| pg3    | pg3  | Replica | streaming | 13 |  0/4C01DDB0 |   0 | 0/4C01DDB0 |   0 |
++--------+------+---------+-----------+----+-------------+-----+------------+-----+
+   PASS backup is running from replica pg2
+
+== Planned switchover: promote exactly that replica (pg1 -> pg2) while it is being backed up
+| pg2    | pg2  | Leader  | running             | 13 |             |     |            |     |
+| pg3    | pg3  | Replica | in archive recovery | 13 |  0/4D0000A0 |   0 | 0/4D0000A0 |   0 |
++--------+------+---------+---------------------+----+-------------+-----+------------+-----+
+--- pgbr log
+   2026-11-23T14:53:31Z [31502] backup 20261123T145331F: type=full parent=none source=pg2 (replica) pg2:5432
+   2026-11-23T14:53:41Z [31502] backup 20261123T145331F: pg_basebackup failed: HINT:  This means that the backup being taken is corrupt and should not be used. Try taking another online backup. pg_basebackup: removing data directory "/srv/pgbackup/pglab/base/.inprogress-20261123T145331F/data" 
+   2026-11-23T14:53:44Z [31502] backup 20261123T145344F: type=full parent=none source=pg1 (replica) pg1:5432
+   2026-11-23T14:54:48Z [31502] backup 20261123T145344F: verifying with pg_verifybackup
+   2026-11-23T14:54:48Z [31502] backup 20261123T145344F: OK (full from pg1, timeline 14, 0/4D0001A8..0/4D0049D0, 62 MiB)
+   20261123T145344F
+   PASS pgbr backup exit code (0)
+   PASS the interrupted attempt on pg2 was detected
+   PASS backup 20261123T145344F completed from pg1 instead
+   PASS backup 20261123T145344F verified by pg_verifybackup (ok)
+   PASS no half-finished backup left in the repository (0)
+   PASS new leader (pg2)
+   PASS both other nodes follow the new leader
++ Cluster: pglab (7711370960295306399) ----+-------------+-----+------------+-----+
+| Member | Host | Role    | State     | TL | Receive LSN | Lag | Replay LSN | Lag |
++--------+------+---------+-----------+----+-------------+-----+------------+-----+
+| pg1    | pg1  | Replica | streaming | 14 |  0/4E0000F0 |   0 | 0/4E0000F0 |   0 |
+| pg2    | pg2  | Leader  | running   | 14 |             |     |            |     |
+| pg3    | pg3  | Replica | streaming | 14 |  0/4E0000F0 |   0 | 0/4E0000F0 |   0 |
++--------+------+---------+-----------+----+-------------+-----+------------+-----+
+
+== Scenario 3 passed
+
+ 04-cluster-pitr.sh 
+
+== Before: healthy cluster, note the last good moment
++ Cluster: pglab (7711370960295306399) ----+-------------+-----+------------+-----+
+| Member | Host | Role    | State     | TL | Receive LSN | Lag | Replay LSN | Lag |
++--------+------+---------+-----------+----+-------------+-----+------------+-----+
+| pg1    | pg1  | Replica | streaming | 14 |  0/4E0000F0 |   0 | 0/4E0000F0 |   0 |
+| pg2    | pg2  | Leader  | running   | 14 |             |     |            |     |
+| pg3    | pg3  | Replica | streaming | 14 |  0/4E0000F0 |   0 | 0/4E0000F0 |   0 |
++--------+------+---------+-----------+----+-------------+-----+------------+-----+
+   last good moment: 2026-11-23T14:54:53.556202+00:00  (timeline 14, 1714 heartbeat rows)
+
+== The bad release: half the heartbeat rows deleted, orders dropped. Nobody notices for a while.
+   damaged state at 2026-11-23T14:55:09.229198+00:00: 870 heartbeat rows; backup 20261123T145502I was taken after the damage
+
+== Rewind the cluster to 2026-11-23T14:54:53.556202+00:00
+leader=pg2 replicas=[pg1 pg3] restore-node=pg2
+
+-- 1/8 save the cluster-wide (DCS) configuration
+saved to pg2:/var/lib/postgresql/dcs-config.saved.yml
+
+-- 2/8 stop Patroni everywhere: replicas first, the leader last (no failover, clean shutdown)
+stopped on pg1
+stopped on pg3
+stopped on pg2
+
+-- 3/8 remove the cluster state from the DCS (it describes a future that is about to be abandoned)
+removed /service/pglab from the DCS
+
+-- 4/8 restore + recover on pg2 (PostgreSQL only, local socket, strict restore_command)
+2026-11-23T14:55:18Z [pgbr-node-restore] using backup 20261123T145344F
+2026-11-23T14:55:18Z [pgbr-node-restore] moving old data directory to /var/lib/postgresql/17/main.pre-pitr.20261123T145518 (delete it once the restore is validated)
+2026-11-23T14:55:18Z [pgbr-node-restore] streaming backup 20261123T145344F from the repository
+2026-11-23T14:55:18Z [pgbr-node-restore] starting PostgreSQL for recovery (socket only), log: /var/log/pgbr/pitr-postgres.log
+waiting for server to start.... done
+server started
+2026-11-23T14:55:21Z [pgbr-node-restore] recovery complete: now on timeline 15, last replayed commit 2026-11-23 15:54:53.197222+01
+waiting for server to shut down.... done
+server stopped
+2026-11-23T14:55:21Z [pgbr-node-restore] PostgreSQL stopped cleanly. Next: start Patroni on this node (it becomes the leader), then on the others.
+
+-- 5/8 start Patroni on pg2: it adopts the recovered data directory and becomes leader
++ Cluster: pglab (7711370960295306399) -+-------------+-----+------------+-----+
+| Member | Host | Role   | State   | TL | Receive LSN | Lag | Replay LSN | Lag |
++--------+------+--------+---------+----+-------------+-----+------------+-----+
+| pg2    | pg2  | Leader | running | 15 |             |     |            |     |
++--------+------+--------+---------+----+-------------+-----+------------+-----+
+
+-- 6/8 make sure the cluster-wide configuration is the one saved in step 1
+Not changed
+
+-- 7/8 start Patroni on the other nodes: they rewind (or re-clone) onto the new timeline
++ Cluster: pglab (7711370960295306399) ----+-------------+-----+------------+-----+
+| Member | Host | Role    | State     | TL | Receive LSN | Lag | Replay LSN | Lag |
++--------+------+---------+-----------+----+-------------+-----+------------+-----+
+| pg1    | pg1  | Replica | streaming | 16 |  0/51000AF0 |   0 | 0/51000AF0 |   0 |
+| pg2    | pg2  | Leader  | running   | 16 |             |     |            |     |
+| pg3    | pg3  | Replica | streaming | 16 |  0/51000928 |   0 | 0/51000928 |   0 |
++--------+------+---------+-----------+----+-------------+-----+------------+-----+
+
+-- 8/8 new full backup: the first restore point on the new timeline
+2026-11-23T14:56:39Z [34079] backup 20261123T145639F: type=full parent=none source=pg1 (replica) pg1:5432
+2026-11-23T14:56:40Z [34079] backup 20261123T145639F: verifying with pg_verifybackup
+2026-11-23T14:56:40Z [34079] backup 20261123T145639F: OK (full from pg1, timeline 16, 0/500000D8..0/51000C80, 62 MiB)
+20261123T145639F
+
+Done. The pre-PITR data directory of pg2 was kept next to PGDATA (*.pre-pitr.*); remove it once you are satisfied.
+
+== After: what the cluster contains
+   PASS cluster runs on a new timeline (14 -> 16)
+   PASS all heartbeat rows up to the good moment are back (1714)
+   PASS nothing written after the good moment on the old timeline survived (0)
+   PASS orders table is back (1000)
+   PASS application writes resumed on timeline 16
+   PASS replica pg1 has the same data (1714)
+   PASS replica pg3 has the same data (1714)
+
+== Repository after the rewind
+OK    patroni: leader=pg2 timeline=16 members=pg1:replica:streaming,pg2:leader:running,pg3:replica:streaming
+OK    backup: newest is 20261123T145639F (full from pg1), 0min old; 10 usable backup(s)
+OK    timeline: backups only restorable with an explicit older --target-timeline: 20261123T143900I 20261123T145502I 
+OK    wal: continuous from backup 20261123T143813F to the newest archived segment on timeline 16
+OK    wal: last segment archived 1s ago (000000100000000000000052.zst)
+OK    archiver: healthy on the leader (0 waiting, 0 failures since stats reset)
+OK    restore-test: last success 0h ago (backup 20261123T144346I)
+   PASS archive is continuous along the new timeline
+   PASS backup 20261123T145502I (abandoned branch) is flagged, not offered for normal restores
+ID                TYPE  PARENT            STATUS  SOURCE   TLI  START_LSN    STOP_LSN     STOP_TIME                   SIZE_MIB
+20261123T143813F  full  -                 ok      pg2      7    0/290000D8   0/2A000D48   2026-11-23T14:38:14+00:00         62
+20261123T143900I  incr  20261123T143813F  ok      pg2      7    0/2B0220B0   0/2B022180   2026-11-23T14:39:01+00:00         20
+20261123T144034F  full  -                 ok      pg2      9    0/2C0000D8   0/2D000D48   2026-11-23T14:40:35+00:00         62
+20261123T144330F  full  -                 ok      pg2      11   0/330000D8   0/330048A8   2026-11-23T14:43:31+00:00         46
+20261123T144346I  incr  20261123T144330F  ok      pg2      11   0/35000BB8   0/35000C88   2026-11-23T14:43:47+00:00         20
+20261123T144419I  incr  20261123T144346I  ok      pg1      11   0/37000028   0/37000120   2026-11-23T14:44:20+00:00         20
+20261123T145313I  incr  20261123T144419I  ok      pg3      13   0/4B0000F0   0/4B002048   2026-11-23T14:53:14+00:00         20
+20261123T145344F  full  -                 ok      pg1      14   0/4D0001A8   0/4D0049D0   2026-11-23T14:54:48+00:00         62
+20261123T145502I  incr  20261123T145344F  ok      pg1      14   0/4F02FA30   0/4F02FB00   2026-11-23T14:55:04+00:00         20
+20261123T145639F  full  -                 ok      pg1      16   0/500000D8   0/51000C80   2026-11-23T14:56:40+00:00         62
+
+== The abandoned timeline is still reachable on purpose: side restore to 2026-11-23T14:55:09.229198+00:00 on timeline 14
+   2026-11-23T14:56:46Z [35150] restore: backup 20261123T145502I -> /srv/pgbackup/pglab/scratch/pitr-branch (target: recovery_target_time = '2026-11-23T14:55:09.229198+00:00', timeline 14, action promote)
+   2026-11-23T14:56:49Z [35150] restore: instance is up on port 5443 (socket /var/run/postgresql): promoted, timeline 17, last replayed commit 2026-11-23 14:55:08.858912+00
+   PASS side instance shows the damaged state of the old timeline (870)
+
+== Clean up the kept pre-PITR data directory
+
+== Scenario 4 passed
+
+ 05-retention-and-drills.sh 
+
+== Repository before retention
+ID                TYPE  PARENT            STATUS  SOURCE   TLI  START_LSN    STOP_LSN     STOP_TIME                   SIZE_MIB
+20261123T143813F  full  -                 ok      pg2      7    0/290000D8   0/2A000D48   2026-11-23T14:38:14+00:00         62
+20261123T143900I  incr  20261123T143813F  ok      pg2      7    0/2B0220B0   0/2B022180   2026-11-23T14:39:01+00:00         20
+20261123T144034F  full  -                 ok      pg2      9    0/2C0000D8   0/2D000D48   2026-11-23T14:40:35+00:00         62
+20261123T144330F  full  -                 ok      pg2      11   0/330000D8   0/330048A8   2026-11-23T14:43:31+00:00         46
+20261123T144346I  incr  20261123T144330F  ok      pg2      11   0/35000BB8   0/35000C88   2026-11-23T14:43:47+00:00         20
+20261123T144419I  incr  20261123T144346I  ok      pg1      11   0/37000028   0/37000120   2026-11-23T14:44:20+00:00         20
+20261123T145313I  incr  20261123T144419I  ok      pg3      13   0/4B0000F0   0/4B002048   2026-11-23T14:53:14+00:00         20
+20261123T145344F  full  -                 ok      pg1      14   0/4D0001A8   0/4D0049D0   2026-11-23T14:54:48+00:00         62
+20261123T145502I  incr  20261123T145344F  ok      pg1      14   0/4F02FA30   0/4F02FB00   2026-11-23T14:55:04+00:00         20
+20261123T145639F  full  -                 ok      pg1      16   0/500000D8   0/51000C80   2026-11-23T14:56:40+00:00         62
+   64 archived segments; with 'keep 2 fulls, window 0 days' the anchor must be 20261123T145344F
+
+== Dry run
+   2026-11-23T14:56:50Z [36644] expire: removing backup 20261123T143813F (full, ok)
+   2026-11-23T14:56:50Z [36644] expire: removing backup 20261123T143900I (incr, ok)
+   2026-11-23T14:56:50Z [36644] expire: removing backup 20261123T144034F (full, ok)
+   2026-11-23T14:56:50Z [36644] expire: removing backup 20261123T144330F (full, ok)
+   2026-11-23T14:56:50Z [36644] expire: removing backup 20261123T144346I (incr, ok)
+   2026-11-23T14:56:50Z [36644] expire: removing backup 20261123T144419I (incr, ok)
+   2026-11-23T14:56:50Z [36644] expire: removing backup 20261123T145313I (incr, ok)
+   2026-11-23T14:56:50Z [36644] expire: oldest kept backup is 20261123T145344F; removing archived WAL older than 0000000E000000000000004D
+   ...and 53 archived WAL file(s)
+   PASS dry run removed nothing (10 backups, 64 segments)
+
+== Apply retention
+   2026-11-23T14:56:50Z [37120] expire: removing backup 20261123T143813F (full, ok)
+   2026-11-23T14:56:50Z [37120] expire: removing backup 20261123T143900I (incr, ok)
+   2026-11-23T14:56:50Z [37120] expire: removing backup 20261123T144034F (full, ok)
+   2026-11-23T14:56:50Z [37120] expire: removing backup 20261123T144330F (full, ok)
+   2026-11-23T14:56:50Z [37120] expire: removing backup 20261123T144346I (incr, ok)
+   2026-11-23T14:56:50Z [37120] expire: removing backup 20261123T144419I (incr, ok)
+   2026-11-23T14:56:50Z [37120] expire: removing backup 20261123T145313I (incr, ok)
+   2026-11-23T14:56:50Z [37120] expire: oldest kept backup is 20261123T145344F; removing archived WAL older than 0000000E000000000000004D
+ID                TYPE  PARENT            STATUS  SOURCE   TLI  START_LSN    STOP_LSN     STOP_TIME                   SIZE_MIB
+20261123T145344F  full  -                 ok      pg1      14   0/4D0001A8   0/4D0049D0   2026-11-23T14:54:48+00:00         62
+20261123T145502I  incr  20261123T145344F  ok      pg1      14   0/4F02FA30   0/4F02FB00   2026-11-23T14:55:04+00:00         20
+20261123T145639F  full  -                 ok      pg1      16   0/500000D8   0/51000C80   2026-11-23T14:56:40+00:00         62
+   PASS oldest remaining backup is the anchor full (20261123T145344F)
+   PASS no archived WAL older than the anchor's start segment (0000000E000000000000004D) (0)
+   PASS timeline history files are kept (15)
+   archived segments: 64 -> 12
+
+== Health after retention
+OK    patroni: leader=pg2 timeline=16 members=pg1:replica:streaming,pg2:leader:running,pg3:replica:streaming
+OK    backup: newest is 20261123T145639F (full from pg1), 0min old; 3 usable backup(s)
+OK    timeline: backups only restorable with an explicit older --target-timeline: 20261123T145502I 
+OK    wal: continuous from backup 20261123T145344F to the newest archived segment on timeline 16
+OK    wal: last segment archived 1s ago (000000100000000000000053.zst)
+OK    archiver: healthy on the leader (0 waiting, 0 failures since stats reset)
+OK    restore-test: last success 0h ago (backup 20261123T144346I)
+   PASS archive still continuous from the oldest kept backup
+
+== Re-verify every stored backup (bit-rot check)
+   2026-11-23T14:56:52Z [37768] verify 20261123T145344F: ok
+   2026-11-23T14:56:52Z [37768] verify 20261123T145502I: ok
+   2026-11-23T14:56:52Z [37768] verify 20261123T145639F: ok
+   PASS all remaining backups verify (0)
+
+== Detect a damaged backup: flip one byte in a data file of the oldest backup
+   PASS pg_verifybackup caught the corruption
+   PASS backup 20261123T145344F is marked corrupt and excluded from restores (corrupt)
+   PASS after repairing the file the backup verifies again
+
+== Restore drill: newest backup + all archived WAL + pg_amcheck
+   2026-11-23T14:56:55Z [38044] restore-test: OK backup=20261123T145639F duration=3s databases=3 recovered_to=2026-11-23T14:56:50+00:00 amcheck=clean
+   PASS restore drill (ok)
+
+== Pause-and-inspect restore: stop at the target, look, then decide
+   2026-11-23T14:57:01Z [38337] restore: instance is up on port 5444 (socket /var/run/postgresql): paused in recovery at 0/540004E8, last replayed commit 2026-11-23 14:56:55.426293+00
+   PASS instance is paused in recovery at the target (true paused)
+   PASS data visible while paused matches the target (1802)
+   PASS resume promotes it (f)
+
+== Scenario 5 passed
+
+ 06-cluster-pitr-two-phase.sh 
+
+== Note a good moment, then damage the data, then note a (too late) second moment
+   good: 2026-11-23T14:57:08.217537+00:00 (1814 rows)   too late: 2026-11-23T14:57:15.094899+00:00 (1214 rows, damage included)
+
+== Phase 1, first attempt: recover to the too-late moment and pause
+   2026-11-23T14:57:24Z [pgbr-node-restore] using backup 20261123T145639F
+   2026-11-23T14:57:24Z [pgbr-node-restore] moving old data directory to /var/lib/postgresql/17/main.pre-pitr.20261123T145724 (delete it once the restore is validated)
+   2026-11-23T14:57:24Z [pgbr-node-restore] streaming backup 20261123T145639F from the repository
+   2026-11-23T14:57:24Z [pgbr-node-restore] starting PostgreSQL for recovery (socket only), log: /var/log/pgbr/pitr-postgres.log
+   2026-11-23T14:57:27Z [pgbr-node-restore] recovery is PAUSED at the target (replayed to 0/55009170, last commit 2026-11-23 15:57:14.187529+01).
+   2026-11-23T14:57:27Z [pgbr-node-restore] Inspect it:  psql -h /var/run/postgresql -p 5432    (read only)
+   2026-11-23T14:57:27Z [pgbr-node-restore] Accept it:   pgbr-node-restore --resume
+   2026-11-23T14:57:27Z [pgbr-node-restore] Reject it:   pg_ctl -D /var/lib/postgresql/17/main -m fast stop, then run pgbr-node-restore again with another target
+   PASS recovery is paused on pg2 (paused)
+   PASS inspection shows the damage is already there: reject this moment (1214)
+   PASS Patroni is still down, nothing is committed (inactive)
+
+== Reject it and recover again, to the good moment
+   2026-11-23T14:57:28Z [pgbr-node-restore] using backup 20261123T145639F
+   2026-11-23T14:57:28Z [pgbr-node-restore] removing old data directory
+   2026-11-23T14:57:28Z [pgbr-node-restore] streaming backup 20261123T145639F from the repository
+   2026-11-23T14:57:28Z [pgbr-node-restore] starting PostgreSQL for recovery (socket only), log: /var/log/pgbr/pitr-postgres.log
+   2026-11-23T14:57:31Z [pgbr-node-restore] recovery is PAUSED at the target (replayed to 0/550007A8, last commit 2026-11-23 15:57:07.90374+01).
+   2026-11-23T14:57:31Z [pgbr-node-restore] Inspect it:  psql -h /var/run/postgresql -p 5432    (read only)
+   2026-11-23T14:57:31Z [pgbr-node-restore] Accept it:   pgbr-node-restore --resume
+   2026-11-23T14:57:31Z [pgbr-node-restore] Reject it:   pg_ctl -D /var/lib/postgresql/17/main -m fast stop, then run pgbr-node-restore again with another target
+   PASS inspection shows the undamaged data: accept this moment (1814)
+
+== Phase 2: accept - promote, hand over to Patroni, re-attach the replicas, take a full backup
+   -- 4/8 accept the paused recovery on pg2: promote and shut down cleanly
+   2026-11-23T14:57:34Z [pgbr-node-restore] recovery complete: now on timeline 17, last replayed commit 2026-11-23 15:57:07.90374+01
+   waiting for server to shut down.... done
+   server stopped
+   2026-11-23T14:57:34Z [pgbr-node-restore] PostgreSQL stopped cleanly. Next: start Patroni on this node (it becomes the leader), then on the others.
+   -- 5/8 start Patroni on pg2: it adopts the recovered data directory and becomes leader
+   + Cluster: pglab (7711370960295306399) -+-------------+-----+------------+-----+
+   | Member | Host | Role   | State   | TL | Receive LSN | Lag | Replay LSN | Lag |
+   +--------+------+--------+---------+----+-------------+-----+------------+-----+
+   | pg2    | pg2  | Leader | running | 17 |             |     |            |     |
+   +--------+------+--------+---------+----+-------------+-----+------------+-----+
+   -- 6/8 make sure the cluster-wide configuration is the one saved in step 1
+   Not changed
+   -- 7/8 start Patroni on the other nodes: they rewind (or re-clone) onto the new timeline
+   + Cluster: pglab (7711370960295306399) ----+-------------+-----+------------+-----+
+   | Member | Host | Role    | State     | TL | Receive LSN | Lag | Replay LSN | Lag |
+   +--------+------+---------+-----------+----+-------------+-----+------------+-----+
+   | pg1    | pg1  | Replica | streaming | 18 |  0/56003330 |   0 | 0/56003330 |   0 |
+   | pg2    | pg2  | Leader  | running   | 18 |             |     |            |     |
+   | pg3    | pg3  | Replica | streaming | 18 |  0/56003330 |   0 | 0/56003330 |   0 |
+   +--------+------+---------+-----------+----+-------------+-----+------------+-----+
+   -- 8/8 new full backup: the first restore point on the new timeline
+   2026-11-23T14:57:59Z [39357] backup 20261123T145759F: type=full parent=none source=pg1 (replica) pg1:5432
+   2026-11-23T14:58:00Z [39357] backup 20261123T145759F: verifying with pg_verifybackup
+   2026-11-23T14:58:00Z [39357] backup 20261123T145759F: OK (full from pg1, timeline 18, 0/560000D8..0/560034C0, 46 MiB)
+   20261123T145759F
+   Done. The pre-PITR data directory of pg2 was kept next to PGDATA (*.pre-pitr.*); remove it once you are satisfied.
+
+== Result
+   PASS leader (pg2)
+   PASS new timeline (16 -> 18)
+   PASS data at the good moment is complete (1814)
+   PASS 1 primary + 2 streaming replicas
+OK    patroni: leader=pg2 timeline=18 members=pg1:replica:streaming,pg2:leader:running,pg3:replica:streaming
+OK    backup: newest is 20261123T145759F (full from pg1), 0min old; 4 usable backup(s)
+OK    timeline: backups only restorable with an explicit older --target-timeline: 20261123T145502I 
+OK    wal: continuous from backup 20261123T145344F to the newest archived segment on timeline 18
+OK    wal: last segment archived 1s ago (000000120000000000000057.zst)
+OK    archiver: healthy on the leader (0 waiting, 0 failures since stats reset)
+OK    restore-test: last success 0h ago (backup 20261123T145639F)
+   PASS archive continuous on the new timeline
+
+== Scenario 6 passed
+
+All scenarios passed.
+exit=0

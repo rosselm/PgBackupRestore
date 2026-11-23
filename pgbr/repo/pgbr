@@ -1,0 +1,947 @@
+#!/usr/bin/env bash
+# pgbr - Patroni-aware PostgreSQL backup / PITR orchestration built only on native tools:
+#        pg_basebackup, pg_verifybackup, pg_combinebackup, pg_archivecleanup, pg_amcheck.
+#
+# Runs on the backup repository host as the repository owner (postgres).
+# One config file per cluster: /etc/pgbr/<cluster>.conf
+set -Eeuo pipefail
+shopt -s nullglob
+export LC_ALL=C
+umask 077
+
+PROG=pgbr
+CONF_DIR=${PGBR_CONF_DIR:-/etc/pgbr}
+LOGFILE=""
+CLEANUP_PATHS=()
+
+usage() {
+  cat <<'EOF'
+Usage: pgbr [-c CLUSTER] COMMAND [options]
+
+Backups
+  backup [--type auto|full|incr] [--from NODE]   take a base backup (default: auto), then verify it
+  list                                           list backups in the repository
+  verify [ID | --all]                            re-run pg_verifybackup on stored backups (bit-rot check)
+  expire [--dry-run]                             apply retention to backups and the WAL archive
+
+Restore
+  restore --target-dir DIR [--backup ID]
+          [--target-time ISO8601 | --target-lsn LSN | --target-name NAME | --immediate]
+          [--target-timeline latest|N] [--action promote|pause|shutdown]
+          [--port PORT] [--listen ADDR] [--start]
+                                                 build a side instance on this host recovered to the target
+  restore-test [--backup ID] [--amcheck]         restore the newest backup + all archived WAL, run checks, clean up
+
+Monitoring
+  check                                          backup freshness, WAL archive continuity, archiver health
+                                                 (exit 0 ok, 1 warning, 2 critical)
+
+Plumbing
+  wal-fetch NAME DEST                            restore_command for instances restored on this host
+  gateway                                        SSH forced command for the PostgreSQL nodes
+
+Target times must carry an explicit UTC offset, e.g. 2026-11-23T15:30:00+00:00
+EOF
+}
+
+# ----------------------------------------------------------------------------------------------
+# helpers
+# ----------------------------------------------------------------------------------------------
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+log() {
+  local line; line="$(ts) [$$] $*"
+  printf '%s\n' "$line" >&2
+  if [[ -n $LOGFILE ]]; then printf '%s\n' "$line" >>"$LOGFILE" 2>/dev/null || true; fi
+}
+die() { log "ERROR: $*"; exit 1; }
+cleanup() {
+  local p
+  for p in "${CLEANUP_PATHS[@]:-}"; do [[ -n $p ]] && rm -rf -- "$p"; done
+  return 0
+}
+trap cleanup EXIT
+
+alert() { # subject, body
+  log "ALERT: $1"
+  if [[ -n ${PGBR_ALERT_CMD:-} ]]; then
+    printf '%s\n' "${2:-$1}" | $PGBR_ALERT_CMD "[pgbr:$PGBR_CLUSTER] $1" || true
+  fi
+}
+
+load_conf() {
+  local cluster=${1:-${PGBR_CLUSTER:-}} conf
+  if [[ -z $cluster ]]; then
+    local -a found=()
+    for conf in "$CONF_DIR"/*.conf; do
+      [[ $(basename "$conf") == node.conf ]] || found+=("$conf")
+    done
+    (( ${#found[@]} == 1 )) || die "specify the cluster with -c (found ${#found[@]} configs in $CONF_DIR)"
+    conf=${found[0]}
+  else
+    [[ $cluster =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid cluster name"
+    conf="$CONF_DIR/$cluster.conf"
+  fi
+  [[ -r $conf ]] || die "config $conf not readable"
+  # shellcheck disable=SC1090
+  source "$conf"
+  : "${PGBR_CLUSTER:?missing in $conf}" "${PGBR_REPO:?missing in $conf}" "${PGBR_PGBIN:?missing in $conf}"
+  PGBR_PGUSER=${PGBR_PGUSER:-backup}
+  PGBR_PATRONI_ENDPOINTS=${PGBR_PATRONI_ENDPOINTS:-}
+  PGBR_BACKUP_FROM=${PGBR_BACKUP_FROM:-prefer-replica}
+  PGBR_MAX_REPLICA_LAG_BYTES=${PGBR_MAX_REPLICA_LAG_BYTES:-67108864}
+  PGBR_MANIFEST_CHECKSUMS=${PGBR_MANIFEST_CHECKSUMS:-SHA256}
+  PGBR_INCREMENTAL=${PGBR_INCREMENTAL:-1}
+  PGBR_FULL_INTERVAL_DAYS=${PGBR_FULL_INTERVAL_DAYS:-7}
+  PGBR_INCR_FALLBACK_FULL=${PGBR_INCR_FALLBACK_FULL:-1}
+  PGBR_INCR_PRIMARY_CHECKPOINT=${PGBR_INCR_PRIMARY_CHECKPOINT:-1}
+  PGBR_RETENTION_DAYS=${PGBR_RETENTION_DAYS:-7}
+  PGBR_KEEP_FULL_MIN=${PGBR_KEEP_FULL_MIN:-2}
+  PGBR_MAX_BACKUP_AGE_HOURS=${PGBR_MAX_BACKUP_AGE_HOURS:-26}
+  PGBR_MAX_ARCHIVE_AGE_SECONDS=${PGBR_MAX_ARCHIVE_AGE_SECONDS:-600}
+  PGBR_MAX_RESTORE_TEST_AGE_DAYS=${PGBR_MAX_RESTORE_TEST_AGE_DAYS:-8}
+  PGBR_WAL_COMPRESS_LEVEL=${PGBR_WAL_COMPRESS_LEVEL:-3}
+  PGBR_RESTORE_PORT=${PGBR_RESTORE_PORT:-5499}
+  PGBR_RESTORE_SHARED_BUFFERS=${PGBR_RESTORE_SHARED_BUFFERS:-256MB}
+  PGBR_RESTORE_TIMEOUT=${PGBR_RESTORE_TIMEOUT:-14400}
+  PGBR_SOCKET_DIR=${PGBR_SOCKET_DIR:-/var/run/postgresql}
+  REPO=$PGBR_REPO; WAL=$REPO/wal; BASE=$REPO/base; STATE=$REPO/state; LOGDIR=$REPO/log
+  SCRATCH=${PGBR_SCRATCH:-$REPO/scratch}
+  SEGSZ=${PGBR_WAL_SEGSIZE:-16777216}
+  SEGS_PER_ID=$(( 0x100000000 / SEGSZ ))
+  mkdir -p "$WAL/.tmp" "$BASE" "$STATE" "$LOGDIR" "$SCRATCH"
+  LOGFILE=$LOGDIR/pgbr.log
+}
+
+# --- LSN / WAL file name arithmetic ---------------------------------------------------------
+lsn_to_dec() { local hi=${1%/*} lo=${1#*/}; echo $(( (16#$hi << 32) + 16#$lo )); }
+lsn_segno()  { echo $(( $(lsn_to_dec "$1") / SEGSZ )); }
+seg_name()   { printf '%08X%08X%08X' "$1" $(( $2 / SEGS_PER_ID )) $(( $2 % SEGS_PER_ID )); } # tli segno
+name_segno() { echo $(( 16#${1:8:8} * SEGS_PER_ID + 16#${1:16:8} )); }
+name_tli()   { echo $(( 16#${1:0:8} )); }
+
+WAL_SEG_RE='^[0-9A-F]{24}$'
+WAL_ANY_RE='^([0-9A-F]{24}(\.partial)?|[0-9A-F]{8}\.history|[0-9A-F]{24}\.[0-9A-F]{8}\.backup)$'
+ID_RE='^[0-9]{8}T[0-9]{6}[FI]$'
+
+# Highest timeline known to the archive (what recovery_target_timeline=latest resolves to).
+latest_tli() {
+  local max=1 f t
+  for f in "$WAL"/*.history; do
+    t=$(( 16#$(basename "$f" .history) )); (( t > max )) && max=$t
+  done
+  echo "$max"
+}
+
+# Lineage of timeline $1 as lines "tli begin_dec end_dec" (end 0 = open ended), oldest first.
+lineage() {
+  local tli=$1 f prev=0 ptli lsn rest e
+  f="$WAL/$(printf '%08X' "$tli").history"
+  if [[ -f $f ]]; then
+    while read -r ptli lsn rest; do
+      [[ $ptli =~ ^[0-9]+$ && $lsn =~ ^[0-9A-Fa-f]+/[0-9A-Fa-f]+$ ]] || continue
+      e=$(lsn_to_dec "$lsn"); echo "$ptli $prev $e"; prev=$e
+    done <"$f"
+  elif (( tli != 1 )); then
+    return 1
+  fi
+  echo "$tli $prev 0"
+}
+
+# --- backup metadata ------------------------------------------------------------------------
+info_get() { sed -n "s/^$2=//p" "$BASE/$1/backup.info" 2>/dev/null | head -1; }
+info_set() { # id key value
+  local f="$BASE/$1/backup.info"
+  if grep -q "^$2=" "$f"; then sed -i "s|^$2=.*|$2=$3|" "$f"; else printf '%s=%s\n' "$2" "$3" >>"$f"; fi
+}
+all_ids() { local d; for d in "$BASE"/[0-9]*[FI]; do [[ -f $d/backup.info ]] && basename "$d"; done; return 0; }
+ok_ids()  { local id; for id in $(all_ids); do [[ $(info_get "$id" status) == ok ]] && echo "$id"; done; return 0; }
+latest_ok_id() { ok_ids | tail -1; }
+
+# Prints the restore chain (full first) for a backup; fails if any link is missing or not ok.
+chain_of() {
+  local cur=$1 out="" n=0
+  while :; do
+    [[ -d $BASE/$cur/data && $(info_get "$cur" status) == ok ]] || return 1
+    out="$cur${out:+ $out}"
+    [[ $(info_get "$cur" type) == full ]] && break
+    cur=$(info_get "$cur" parent)
+    [[ -n $cur ]] || return 1
+    (( ++n < 1000 )) || return 1
+  done
+  echo "$out"
+}
+
+# Is backup $1 usable for a recovery that follows timeline $2?
+backup_on_lineage() {
+  local btli blsn t b e lin
+  btli=$(info_get "$1" stop_tli); blsn=$(lsn_to_dec "$(info_get "$1" stop_lsn)")
+  lin=$(lineage "$2" || true)     # read fully first: returning early from a pipe makes the writer hit EPIPE
+  while read -r t b e; do
+    [[ -n $t ]] || continue
+    if (( t == btli )); then
+      (( e == 0 || blsn <= e )) && return 0
+      return 1
+    fi
+  done <<<"$lin"
+  return 1
+}
+
+epoch_of() { # ISO timestamp with explicit offset -> epoch
+  [[ $1 =~ (Z|[+-][0-9]{2}(:?[0-9]{2})?)$ ]] || die "time '$1' needs an explicit UTC offset (e.g. +00:00)"
+  date -u -d "$1" +%s 2>/dev/null || die "cannot parse time '$1'"
+}
+
+# select_backup [--backup ID] [--target-time T] [--target-lsn L] [--target-timeline latest|N]
+select_backup() {
+  local want="" ttime="" tlsn="" ttl=latest a
+  for a in "$@"; do
+    case $a in
+      --backup=*) want=${a#*=};;
+      --target-time=*) ttime=${a#*=};;
+      --target-lsn=*) tlsn=${a#*=};;
+      --target-timeline=*) ttl=${a#*=};;
+      *) die "select: unknown argument $a";;
+    esac
+  done
+  if [[ -n $want ]]; then
+    [[ $want =~ $ID_RE ]] || die "invalid backup id '$want'"
+    chain_of "$want" >/dev/null || die "backup $want is missing, not ok, or its chain is broken"
+    echo "$want"; return 0
+  fi
+  local tli epoch="" lsn=""
+  if [[ $ttl == latest ]]; then tli=$(latest_tli); else [[ $ttl =~ ^[0-9]+$ ]] || die "bad timeline '$ttl'"; tli=$ttl; fi
+  [[ -n $ttime ]] && epoch=$(epoch_of "$ttime")
+  [[ -n $tlsn ]] && lsn=$(lsn_to_dec "$tlsn")
+  local id best=""
+  for id in $(ok_ids); do
+    backup_on_lineage "$id" "$tli" || continue
+    [[ -z $epoch ]] || (( $(info_get "$id" stop_epoch) <= epoch )) || continue
+    [[ -z $lsn ]] || (( $(lsn_to_dec "$(info_get "$id" stop_lsn)") <= lsn )) || continue
+    chain_of "$id" >/dev/null || continue
+    best=$id
+  done
+  [[ -n $best ]] || die "no usable backup for target (time='${ttime:-}' lsn='${tlsn:-}' timeline=$tli)"
+  echo "$best"
+}
+
+# --- Patroni / SQL --------------------------------------------------------------------------
+patroni_cluster() {
+  local ep out
+  for ep in $PGBR_PATRONI_ENDPOINTS; do
+    if out=$(curl -fsS --max-time "${PGBR_API_TIMEOUT:-5}" "$ep/cluster" 2>/dev/null) \
+       && jq -e '.members | length > 0' >/dev/null 2>&1 <<<"$out"; then
+      printf '%s' "$out"; return 0
+    fi
+  done
+  return 1
+}
+leader_of() { jq -r '.members[] | select(.role=="leader" and .state=="running") | "\(.name) \(.host) \(.port)"' <<<"$1" | head -1; }
+sql() { # host port query...
+  local h=$1 p=$2; shift 2
+  local -a args=(); local q
+  for q in "$@"; do args+=(-c "$q"); done
+  PGCONNECT_TIMEOUT=10 PGAPPNAME=pgbr "$PGBR_PGBIN/psql" -h "$h" -p "$p" -U "$PGBR_PGUSER" -d postgres \
+    -w -XAtq -v ON_ERROR_STOP=1 "${args[@]}"
+}
+
+# Ordered backup sources as "name host port role" lines, honouring PGBR_BACKUP_FROM.
+backup_candidates() {
+  local json=$1 replicas leader
+  replicas=$(jq -r --argjson maxlag "$PGBR_MAX_REPLICA_LAG_BYTES" '
+      [ .members[]
+        | select(.role=="replica" or .role=="sync_standby" or .role=="quorum_standby")
+        | select(.state=="streaming" or .state=="running")
+        | select((.tags.nobackup // false) != true)
+        | select((.lag|type)=="number" and .lag <= $maxlag) ]
+      | sort_by(.lag, .name)[] | "\(.name) \(.host) \(.port) replica"' <<<"$json")
+  leader=$(jq -r '.members[] | select(.role=="leader" and .state=="running")
+                  | "\(.name) \(.host) \(.port) primary"' <<<"$json")
+  case $PGBR_BACKUP_FROM in
+    replica)        [[ -n $replicas ]] && echo "$replicas";;
+    prefer-replica) [[ -n $replicas ]] && echo "$replicas"; [[ -n $leader ]] && echo "$leader";;
+    primary)        [[ -n $leader ]] && echo "$leader";;
+    *) die "PGBR_BACKUP_FROM must be replica, prefer-replica or primary";;
+  esac
+  return 0
+}
+
+# ----------------------------------------------------------------------------------------------
+# backup
+# ----------------------------------------------------------------------------------------------
+LEADER_HOST=""; LEADER_PORT=""
+
+# An incremental backup needs a restartpoint newer than its parent's start. A standby can only
+# create restartpoints at checkpoints it has replayed, so ask the primary for one first.
+primary_checkpoint_and_wait() { # replica host port
+  [[ -n $LEADER_HOST ]] || return 1
+  local ckpt i
+  ckpt=$(sql "$LEADER_HOST" "$LEADER_PORT" "checkpoint" "select checkpoint_lsn from pg_control_checkpoint()") || return 1
+  for (( i = 0; i < 60; i++ )); do
+    [[ $(sql "$1" "$2" "select pg_last_wal_replay_lsn() >= '$ckpt'::pg_lsn" 2>/dev/null) == t ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+run_backup() { # type parent node host port role
+  local type=$1 parent=$2 node=$3 host=$4 port=$5 role=$6
+  local id work sysid start_time stop_time stop_epoch
+  id="$(date -u +%Y%m%dT%H%M%S)$([[ $type == full ]] && echo F || echo I)"
+  work="$BASE/.inprogress-$id"
+  rm -rf "$work"; mkdir -p "$work"; CLEANUP_PATHS+=("$work")
+  log "backup $id: type=$type parent=${parent:-none} source=$node ($role) $host:$port"
+
+  if ! sysid=$(sql "$host" "$port" "select system_identifier from pg_control_system()"); then
+    log "backup $id: cannot query $node"; rm -rf "$work"; return 1
+  fi
+  if [[ -s $STATE/system_id && $(<"$STATE/system_id") != "$sysid" ]]; then
+    die "system identifier of $node ($sysid) differs from the repository's ($(<"$STATE/system_id")): refusing to mix clusters"
+  fi
+
+  if [[ $type == incr && $role == replica && $PGBR_INCR_PRIMARY_CHECKPOINT == 1 ]]; then
+    primary_checkpoint_and_wait "$host" "$port" || log "backup $id: could not force/await a primary checkpoint (continuing)"
+  fi
+
+  start_time=$(sql "$host" "$port" "select to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"+00:00\"')") || start_time=$(date -u +%Y-%m-%dT%H:%M:%S+00:00)
+
+  local -a cmd=("$PGBR_PGBIN/pg_basebackup" -h "$host" -p "$port" -U "$PGBR_PGUSER" -w
+                -D "$work/data" -Fp -X stream -c fast -l "pgbr:$PGBR_CLUSTER:$id"
+                --manifest-checksums="$PGBR_MANIFEST_CHECKSUMS")
+  [[ $type == incr ]] && cmd+=(--incremental="$BASE/$parent/data/backup_manifest")
+  [[ -n ${PGBR_MAX_RATE:-} ]] && cmd+=(--max-rate="$PGBR_MAX_RATE")
+
+  if ! PGAPPNAME=pgbr-basebackup PGCONNECT_TIMEOUT=10 "${cmd[@]}" >"$work/pg_basebackup.log" 2>&1; then
+    log "backup $id: pg_basebackup failed: $(tail -n 2 "$work/pg_basebackup.log" | tr '\n' ' ')"
+    cp "$work/pg_basebackup.log" "$LOGDIR/failed-$id.pg_basebackup.log" 2>/dev/null || true
+    rm -rf "$work"; return 1
+  fi
+
+  # Server clock after the backup returned: a safe (slightly late) upper bound for its consistency point.
+  if stop_time=$(sql "$host" "$port" "select to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"+00:00\"')" 2>/dev/null); then :; else
+    stop_time=$(date -u +%Y-%m-%dT%H:%M:%S+00:00)
+  fi
+  stop_epoch=$(date -u -d "$stop_time" +%s)
+
+  log "backup $id: verifying with pg_verifybackup"
+  if ! "$PGBR_PGBIN/pg_verifybackup" "$work/data" >"$work/pg_verifybackup.log" 2>&1; then
+    log "backup $id: pg_verifybackup FAILED: $(tail -n 3 "$work/pg_verifybackup.log" | tr '\n' ' ')"
+    cp "$work/pg_verifybackup.log" "$LOGDIR/failed-$id.pg_verifybackup.log" 2>/dev/null || true
+    rm -rf "$work"; return 1
+  fi
+
+  local label="$work/data/backup_label" manifest="$work/data/backup_manifest"
+  local start_lsn start_wal start_tli stop_lsn stop_tli size
+  start_lsn=$(sed -n 's/^START WAL LOCATION: \([0-9A-F/]*\) (file [0-9A-F]*)$/\1/p' "$label")
+  start_wal=$(sed -n 's/^START WAL LOCATION: [0-9A-F/]* (file \([0-9A-F]*\))$/\1/p' "$label")
+  start_tli=$(sed -n 's/^START TIMELINE: //p' "$label")
+  stop_lsn=$(jq -r '."WAL-Ranges"[-1]."End-LSN"' "$manifest")
+  stop_tli=$(jq -r '."WAL-Ranges"[-1].Timeline' "$manifest")
+  size=$(du -sb "$work/data" | cut -f1)
+  [[ -n $start_lsn && -n $start_wal && $stop_lsn == */* ]] || { log "backup $id: could not parse backup_label/manifest"; rm -rf "$work"; return 1; }
+
+  cat >"$work/backup.info" <<EOF
+id=$id
+type=$type
+parent=$parent
+status=ok
+cluster=$PGBR_CLUSTER
+system_id=$sysid
+pg_version=$("$PGBR_PGBIN/postgres" -V | awk '{print $3}')
+source_node=$node
+source_role=$role
+start_time=$start_time
+stop_time=$stop_time
+stop_epoch=$stop_epoch
+start_lsn=$start_lsn
+start_wal=$start_wal
+start_tli=$start_tli
+stop_lsn=$stop_lsn
+stop_tli=$stop_tli
+size_bytes=$size
+verified_at=$(ts)
+EOF
+  sync -f "$work/backup.info"
+  mv "$work" "$BASE/$id"
+  sync "$BASE"
+  echo "$sysid" >"$STATE/system_id"
+  log "backup $id: OK ($type from $node, timeline $stop_tli, $start_lsn..$stop_lsn, $(( size / 1048576 )) MiB)"
+  LAST_BACKUP_ID=$id
+  return 0
+}
+
+# Try one source after another until a backup succeeds. The topology is read again from Patroni
+# before every attempt: a failed attempt usually means it just changed (the source was promoted,
+# restarted to follow a new leader, or died), so the list computed at the start is stale. A node
+# is tried at most once per run; while a failover is settling there may briefly be no candidate.
+try_sources() { # type parent from
+  local type=$1 parent=$2 from=$3
+  local attempts=${PGBR_BACKUP_ATTEMPTS:-6} a json l line node host port role tried=" "
+  for (( a = 1; a <= attempts; a++ )); do
+    if ! json=$(patroni_cluster); then log "no Patroni endpoint reachable (attempt $a/$attempts)"; sleep 10; continue; fi
+    LEADER_HOST=""; LEADER_PORT=""
+    l=$(leader_of "$json")
+    if [[ -n $l ]]; then read -r _ LEADER_HOST LEADER_PORT <<<"$l"; fi
+    local -a cands=()
+    if [[ -n $from ]]; then
+      mapfile -t cands < <(jq -r --arg n "$from" '.members[] | select(.name==$n and (.state=="running" or .state=="streaming"))
+          | "\(.name) \(.host) \(.port) \(if .role=="leader" then "primary" else "replica" end)"' <<<"$json")
+    else
+      mapfile -t cands < <(backup_candidates "$json")
+    fi
+    node=""
+    for line in "${cands[@]}"; do
+      read -r node host port role <<<"$line"
+      [[ $tried == *" $node "* ]] || break
+      node=""
+    done
+    if [[ -z $node ]]; then
+      log "no untried eligible backup source right now (policy=$PGBR_BACKUP_FROM${from:+, from=$from}; tried:${tried}) - attempt $a/$attempts"
+      sleep 10; continue
+    fi
+    tried+="$node "
+    run_backup "$type" "$parent" "$node" "$host" "$port" "$role" && return 0
+    sleep 3
+  done
+  return 1
+}
+
+cmd_backup() {
+  local type=auto from=""
+  while (( $# )); do
+    case $1 in
+      --type) type=$2; shift 2;;
+      --type=*) type=${1#*=}; shift;;
+      --from) from=$2; shift 2;;
+      --from=*) from=${1#*=}; shift;;
+      *) die "backup: unknown option $1";;
+    esac
+  done
+  [[ $type =~ ^(auto|full|incr)$ ]] || die "backup: --type must be auto, full or incr"
+
+  exec 9>"$STATE/backup.lock"
+  flock -n 9 || die "another backup or expire is already running"
+
+  patroni_cluster >/dev/null || { alert "backup failed: no Patroni endpoint reachable"; exit 1; }
+
+  # Decide full vs incremental.
+  local parent="" newest_full="" id
+  parent=$(latest_ok_id)
+  for id in $(ok_ids); do [[ $(info_get "$id" type) == full ]] && newest_full=$id; done
+  if [[ $type == auto ]]; then
+    type=incr
+    if [[ $PGBR_INCREMENTAL != 1 || -z $newest_full ]]; then
+      type=full
+    elif (( $(date +%s) - $(info_get "$newest_full" stop_epoch) >= PGBR_FULL_INTERVAL_DAYS * 86400 )); then
+      type=full
+    fi
+  fi
+  if [[ $type == incr && -z $parent ]]; then log "no previous backup to build on: taking a full instead"; type=full; fi
+  [[ $type == full ]] && parent=""
+
+  LAST_BACKUP_ID=""
+  local ok=0
+  if try_sources "$type" "$parent" "$from"; then
+    ok=1
+  elif [[ $type == incr && $PGBR_INCR_FALLBACK_FULL == 1 ]]; then
+    log "incremental backup failed on every candidate: falling back to a full backup"
+    try_sources full "" "$from" && ok=1
+  fi
+  if (( ! ok )); then alert "backup failed on every eligible source"; exit 1; fi
+
+  # Close the current WAL segment on the primary so everything the backup needs reaches the archive promptly.
+  if [[ -n $LEADER_HOST ]]; then
+    sql "$LEADER_HOST" "$LEADER_PORT" "select pg_switch_wal()" >/dev/null 2>&1 || log "note: could not pg_switch_wal() on the leader"
+  fi
+  echo "$LAST_BACKUP_ID"
+}
+
+# ----------------------------------------------------------------------------------------------
+# list / verify / expire
+# ----------------------------------------------------------------------------------------------
+cmd_list() {
+  printf '%-17s %-5s %-17s %-7s %-8s %-4s %-12s %-12s %-26s %9s\n' \
+    ID TYPE PARENT STATUS SOURCE TLI START_LSN STOP_LSN STOP_TIME SIZE_MIB
+  local id
+  for id in $(all_ids); do
+    printf '%-17s %-5s %-17s %-7s %-8s %-4s %-12s %-12s %-26s %9s\n' \
+      "$id" "$(info_get "$id" type)" "$(info_get "$id" parent | sed 's/^$/-/')" "$(info_get "$id" status)" \
+      "$(info_get "$id" source_node)" "$(info_get "$id" stop_tli)" "$(info_get "$id" start_lsn)" \
+      "$(info_get "$id" stop_lsn)" "$(info_get "$id" stop_time)" "$(( $(info_get "$id" size_bytes) / 1048576 ))"
+  done
+}
+
+cmd_verify() {
+  local -a ids=(); local id rc=0
+  case ${1:---all} in
+    --all) mapfile -t ids < <(all_ids);;
+    *) [[ $1 =~ $ID_RE && -d $BASE/$1 ]] || die "verify: no such backup '$1'"; ids=("$1");;
+  esac
+  for id in "${ids[@]}"; do
+    if "$PGBR_PGBIN/pg_verifybackup" "$BASE/$id/data" >"$BASE/$id/pg_verifybackup.log" 2>&1; then
+      info_set "$id" verified_at "$(ts)"; log "verify $id: ok"
+    else
+      info_set "$id" status corrupt; rc=2
+      alert "backup $id FAILED verification" "$(tail -n 20 "$BASE/$id/pg_verifybackup.log")"
+    fi
+  done
+  return $rc
+}
+
+cmd_expire() {
+  local dry=0; [[ ${1:-} == --dry-run ]] && dry=1
+  exec 9>"$STATE/backup.lock"
+  flock -n 9 || die "a backup is running; not expiring now"
+
+  local -a fulls=(); local id
+  for id in $(ok_ids); do [[ $(info_get "$id" type) == full ]] && fulls+=("$id"); done
+  (( ${#fulls[@]} )) || { log "expire: no full backups, nothing to do"; return 0; }
+
+  # Anchor = newest full that is already older than the PITR window: it is what a restore to the
+  # start of the window would be built on. Never keep fewer than PGBR_KEEP_FULL_MIN fulls.
+  local cutoff=$(( $(date +%s) - PGBR_RETENTION_DAYS * 86400 )) anchor=${fulls[0]} n=${#fulls[@]}
+  for id in "${fulls[@]}"; do (( $(info_get "$id" stop_epoch) <= cutoff )) && anchor=$id; done
+  if (( n > PGBR_KEEP_FULL_MIN )); then
+    local floor=${fulls[$(( n - PGBR_KEEP_FULL_MIN ))]}
+    [[ $anchor > $floor ]] && anchor=$floor
+  else
+    anchor=${fulls[0]}
+  fi
+
+  for id in $(all_ids); do
+    if [[ $id < $anchor ]]; then
+      log "expire: removing backup $id ($(info_get "$id" type), $(info_get "$id" status))"
+      (( dry )) || rm -rf -- "${BASE:?}/$id"
+    fi
+  done
+
+  local keep; keep=$(info_get "$anchor" start_wal)
+  [[ $keep =~ $WAL_SEG_RE ]] || die "expire: anchor $anchor has no start_wal"
+  log "expire: oldest kept backup is $anchor; removing archived WAL older than $keep"
+  local -a opts=(-x .zst)
+  # also drop obsolete *.backup history files (option exists from PostgreSQL 17)
+  if "$PGBR_PGBIN/pg_archivecleanup" --help | grep -q -- '--clean-backup-history'; then opts+=(-b); fi
+  (( dry )) && opts+=(-n)
+  "$PGBR_PGBIN/pg_archivecleanup" "${opts[@]}" "$WAL" "$keep" 2>&1 | sed 's/^/expire: /' >&2 || die "pg_archivecleanup failed"
+  find "$WAL/.tmp" -type f -mmin +120 -delete 2>/dev/null || true
+  find "$BASE" -maxdepth 1 -name '.inprogress-*' -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
+}
+
+# ----------------------------------------------------------------------------------------------
+# restore (side instance on this host)
+# ----------------------------------------------------------------------------------------------
+materialize() { # id dest  -> a complete data directory, synthesised from the full + incrementals
+  local id=$1 dest=$2 chain c
+  chain=$(chain_of "$id") || die "backup $id: restore chain is broken"
+  local -a dirs=()
+  for c in $chain; do dirs+=("$BASE/$c/data"); done
+  log "restore: materialising $id from chain: $chain"
+  "$PGBR_PGBIN/pg_combinebackup" "${dirs[@]}" -o "$dest" >&2 || die "pg_combinebackup failed"
+  chmod 700 "$dest"
+}
+
+cd_get() { "$PGBR_PGBIN/pg_controldata" "$1" | sed -n "s/^$2:[[:space:]]*//p"; }
+
+# Replace the cluster's configuration with a minimal, isolated one. The backup carries the source
+# node's Patroni-generated config (archive_command, primary_conninfo, standby.signal, ...): a side
+# instance must never archive into the real repository or try to follow the real primary.
+prepare_side_instance() { # dest port listen action timeline [recovery_target line]
+  local d=$1 port=$2 listen=$3 action=$4 tl=$5 target=${6:-}
+  rm -f "$d/standby.signal" "$d/postmaster.pid" "$d/postmaster.opts"
+  local f
+  for f in postgresql.conf postgresql.auto.conf pg_hba.conf; do
+    [[ -f $d/$f ]] && mv "$d/$f" "$d/$f.pgbr-orig"
+  done
+  cat >"$d/postgresql.conf" <<EOF
+# generated by pgbr for an isolated restore; the original is postgresql.conf.pgbr-orig
+listen_addresses = '$listen'
+port = $port
+unix_socket_directories = '$PGBR_SOCKET_DIR'
+cluster_name = 'pgbr-restore'
+max_connections = $(cd_get "$d" "max_connections setting")
+max_worker_processes = $(cd_get "$d" "max_worker_processes setting")
+max_wal_senders = $(cd_get "$d" "max_wal_senders setting")
+max_prepared_transactions = $(cd_get "$d" "max_prepared_xacts setting")
+max_locks_per_transaction = $(cd_get "$d" "max_locks_per_xact setting")
+track_commit_timestamp = $(cd_get "$d" "track_commit_timestamp setting")
+shared_buffers = '$PGBR_RESTORE_SHARED_BUFFERS'
+wal_level = replica
+archive_mode = off
+hot_standby = on
+restore_command = '$(readlink -f "$0") -c $PGBR_CLUSTER wal-fetch "%f" "%p"'
+recovery_target_timeline = '$tl'
+recovery_target_action = '$action'
+$target
+EOF
+  [[ -n ${PGBR_RESTORE_EXTRA_CONF:-} ]] && echo "include = '$PGBR_RESTORE_EXTRA_CONF'" >>"$d/postgresql.conf"
+  : >"$d/postgresql.auto.conf"
+  cat >"$d/pg_hba.conf" <<'EOF'
+local all all peer
+host  all all 127.0.0.1/32 scram-sha-256
+host  all all ::1/128 scram-sha-256
+EOF
+  touch "$d/recovery.signal"
+  chmod 600 "$d/postgresql.conf" "$d/postgresql.auto.conf" "$d/pg_hba.conf"
+}
+
+side_sql() { "$PGBR_PGBIN/psql" -h "$PGBR_SOCKET_DIR" -p "$1" -d postgres -XAtq -v ON_ERROR_STOP=1 -c "$2"; }
+
+# Start a prepared instance and wait until recovery has promoted or paused.
+start_and_wait() { # dest port action
+  local d=$1 port=$2 action=$3 waited=0 st
+  "$PGBR_PGBIN/pg_ctl" -D "$d" -l "$d.log" -w -t "$PGBR_RESTORE_TIMEOUT" start >&2 \
+    || { tail -n 15 "$d.log" >&2; die "restore: instance failed to start (see $d.log)"; }
+  while :; do
+    "$PGBR_PGBIN/pg_ctl" -D "$d" status >/dev/null 2>&1 || { tail -n 15 "$d.log" >&2; die "restore: postgres exited during recovery (see $d.log)"; }
+    st=$(side_sql "$port" "select case when not pg_is_in_recovery() then 'promoted' else pg_get_wal_replay_pause_state() end" 2>/dev/null || echo starting)
+    [[ $st == promoted ]] && return 0
+    [[ $st == paused && $action == pause ]] && return 0
+    (( (waited += 2) < PGBR_RESTORE_TIMEOUT )) || die "restore: timed out waiting for recovery"
+    sleep 2
+  done
+}
+
+cmd_restore() {
+  local dest="" action=promote tl=latest port=$PGBR_RESTORE_PORT listen=localhost start=0
+  local ttime="" tlsn="" tname="" immediate=0 backup=""
+  while (( $# )); do
+    case $1 in
+      --target-dir) dest=$2; shift 2;;
+      --backup) backup=$2; shift 2;;
+      --target-time) ttime=$2; shift 2;;
+      --target-lsn) tlsn=$2; shift 2;;
+      --target-name) tname=$2; shift 2;;
+      --immediate) immediate=1; shift;;
+      --target-timeline) tl=$2; shift 2;;
+      --action) action=$2; shift 2;;
+      --port) port=$2; shift 2;;
+      --listen) listen=$2; shift 2;;
+      --start) start=1; shift;;
+      *) die "restore: unknown option $1";;
+    esac
+  done
+  [[ -n $dest ]] || die "restore: --target-dir is required"
+  [[ $action =~ ^(promote|pause|shutdown)$ ]] || die "restore: bad --action"
+  [[ ! -e $dest || -z $(ls -A "$dest") ]] || die "restore: $dest exists and is not empty"
+  [[ -z $tname || -n $backup ]] || die "restore: --target-name needs an explicit --backup"
+
+  local -a sel=(--target-timeline="$tl")
+  [[ -n $backup ]] && sel+=(--backup="$backup")
+  [[ -n $ttime ]] && sel+=(--target-time="$ttime")
+  [[ -n $tlsn ]] && sel+=(--target-lsn="$tlsn")
+  local id target=""
+  id=$(select_backup "${sel[@]}")
+  if   [[ -n $ttime ]];   then epoch_of "$ttime" >/dev/null; target="recovery_target_time = '$ttime'"
+  elif [[ -n $tlsn ]];    then target="recovery_target_lsn = '$tlsn'"
+  elif [[ -n $tname ]];   then target="recovery_target_name = '$tname'"
+  elif (( immediate ));   then target="recovery_target = 'immediate'"
+  fi
+  log "restore: backup $id -> $dest (target: ${target:-end of archived WAL}, timeline $tl, action $action)"
+  mkdir -p "$(dirname "$dest")"
+  materialize "$id" "$dest"
+  prepare_side_instance "$dest" "$port" "$listen" "$action" "$tl" "$target"
+  if (( start )); then
+    start_and_wait "$dest" "$port" "$action"
+    log "restore: instance is up on port $port (socket $PGBR_SOCKET_DIR): $(side_sql "$port" "select case when pg_is_in_recovery() then 'paused in recovery at '||pg_last_wal_replay_lsn() else 'promoted, timeline '||(select timeline_id from pg_control_checkpoint()) end || ', last replayed commit ' || coalesce(pg_last_xact_replay_timestamp()::text,'n/a')")"
+  else
+    log "restore: prepared. Start it with: $PGBR_PGBIN/pg_ctl -D $dest -l $dest.log start"
+  fi
+  echo "$id"
+}
+
+cmd_restore_test() {
+  local backup="" amcheck=0
+  while (( $# )); do
+    case $1 in
+      --backup) backup=$2; shift 2;;
+      --amcheck) amcheck=1; shift;;
+      *) die "restore-test: unknown option $1";;
+    esac
+  done
+  exec 8>"$STATE/restore-test.lock"
+  flock -n 8 || die "a restore test is already running"
+
+  local d="$SCRATCH/restore-test" port=$PGBR_RESTORE_PORT id t0 result=ok detail=""
+  "$PGBR_PGBIN/pg_ctl" -D "$d" -m immediate stop >/dev/null 2>&1 || true
+  rm -rf "$d" "$d.log"
+  t0=$(date +%s)
+  local -a sel=(--target-timeline=latest); [[ -n $backup ]] && sel+=(--backup="$backup")
+  id=$(select_backup "${sel[@]}")
+  CLEANUP_PATHS+=("$d")
+  materialize "$id" "$d"
+  prepare_side_instance "$d" "$port" "" promote latest ""
+  local recovered="" dbs=""
+  if ( start_and_wait "$d" "$port" promote ); then
+    recovered=$(side_sql "$port" "select coalesce(to_char(pg_last_xact_replay_timestamp() at time zone 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"+00:00\"'),'')")
+    dbs=$(side_sql "$port" "select count(*) from pg_database where datallowconn")
+    detail="databases=$dbs recovered_to=${recovered:-n/a}"
+    if [[ -n ${PGBR_RESTORE_TEST_SQL:-} ]]; then
+      local out
+      if out=$(side_sql "$port" "$PGBR_RESTORE_TEST_SQL" 2>&1); then detail+=" custom_sql=[$out]"; else result=failed; detail+=" custom_sql_error=[$out]"; fi
+    fi
+    if (( amcheck )) && [[ $result == ok ]]; then
+      if "$PGBR_PGBIN/pg_amcheck" -h "$PGBR_SOCKET_DIR" -p "$port" --all --install-missing >"$d.amcheck.log" 2>&1; then
+        detail+=" amcheck=clean"
+      else
+        result=failed; detail+=" amcheck=FAILED(see $LOGDIR/restore-test.amcheck.log)"; cp "$d.amcheck.log" "$LOGDIR/restore-test.amcheck.log"
+      fi
+    fi
+  else
+    result=failed; detail="recovery did not complete"
+    cp "$d.log" "$LOGDIR/restore-test.failed.log" 2>/dev/null || true
+  fi
+  "$PGBR_PGBIN/pg_ctl" -D "$d" -m fast -w stop >/dev/null 2>&1 || true
+  rm -rf "$d" "$d.log" "$d.amcheck.log"
+  local took=$(( $(date +%s) - t0 ))
+  printf '%s %s %s %s %s\n' "$(date +%s)" "$result" "$id" "$took" "$detail" >"$STATE/last-restore-test"
+  printf '%s %s %s %ss %s\n' "$(ts)" "$result" "$id" "$took" "$detail" >>"$LOGDIR/restore-test.log"
+  if [[ $result == ok ]]; then
+    log "restore-test: OK backup=$id duration=${took}s $detail"
+  else
+    alert "restore test FAILED for backup $id" "$detail"; return 2
+  fi
+}
+
+# restore_command for instances restored on this host. Exit 1 = "not in the archive" (normal end of
+# recovery); anything else must abort recovery instead of silently ending it early.
+cmd_wal_fetch() {
+  local name=${1:-} dest=${2:-}
+  [[ $name =~ $WAL_ANY_RE && -n $dest ]] || exit 201
+  if [[ -f $WAL/$name.zst ]]; then
+    zstd -dqc "$WAL/$name.zst" >"$dest.pgbr-tmp" && mv "$dest.pgbr-tmp" "$dest" || { rm -f "$dest.pgbr-tmp"; exit 202; }
+  elif [[ -f $WAL/$name ]]; then
+    cp "$WAL/$name" "$dest.pgbr-tmp" && mv "$dest.pgbr-tmp" "$dest" || { rm -f "$dest.pgbr-tmp"; exit 202; }
+  else
+    exit 1
+  fi
+}
+
+# ----------------------------------------------------------------------------------------------
+# check
+# ----------------------------------------------------------------------------------------------
+CHECK_RC=0
+report() { # level message
+  printf '%-5s %s\n' "$1" "$2"
+  case $1 in WARN) (( CHECK_RC < 1 )) && CHECK_RC=1;; CRIT) CHECK_RC=2;; esac
+  return 0
+}
+
+# Every segment a recovery along the newest timeline would ask for, from the oldest usable backup
+# up to the newest archived segment, must be present. Prints missing names.
+wal_gaps() { # from_segno ; sets GAP_FROM/GAP_TO/GAP_COUNT
+  local from=$1 tli newest s i owner
+  tli=$(latest_tli)
+  local -a ltli=() lbeg=()
+  local t b e
+  while read -r t b e; do ltli+=("$t"); lbeg+=($(( b / SEGSZ ))); done < <(lineage "$tli" || true)
+  (( ${#ltli[@]} )) || { echo "no-lineage"; return 0; }
+  newest=$(ls "$WAL" | grep -E "^$(printf '%08X' "$tli")[0-9A-F]{16}\.zst$" | sort | tail -1 || true)
+  local to
+  if [[ -n $newest ]]; then to=$(name_segno "${newest%.zst}"); else to=$(( ${lbeg[-1]} - 1 )); fi
+  GAP_FROM=$from; GAP_TO=$to; GAP_COUNT=0
+  for (( s = from; s <= to; s++ )); do
+    owner=${ltli[0]}
+    for (( i = 0; i < ${#ltli[@]}; i++ )); do (( ${lbeg[i]} <= s )) && owner=${ltli[i]}; done
+    if [[ ! -f $WAL/$(seg_name "$owner" "$s").zst ]]; then
+      echo "$(seg_name "$owner" "$s")"; GAP_COUNT=$(( GAP_COUNT + 1 ))
+    fi
+  done
+}
+
+cmd_check() {
+  local now json; now=$(date +%s)
+
+  # 1. cluster
+  if json=$(patroni_cluster); then
+    local l; l=$(leader_of "$json")
+    if [[ -n $l ]]; then
+      read -r _ LEADER_HOST LEADER_PORT <<<"$l"
+      report OK "patroni: leader=${l%% *} timeline=$(jq -r '[.members[]|select(.role=="leader")][0].timeline' <<<"$json") members=$(jq -r '[.members[]|"\(.name):\(.role):\(.state)"]|join(",")' <<<"$json")"
+    else
+      report CRIT "patroni: cluster has no running leader"
+    fi
+  else
+    report CRIT "patroni: no REST endpoint reachable ($PGBR_PATRONI_ENDPOINTS)"
+  fi
+
+  # 2. backup freshness
+  local last; last=$(latest_ok_id)
+  if [[ -z $last ]]; then
+    report CRIT "backup: no successful backup in the repository"
+  else
+    local age=$(( now - $(info_get "$last" stop_epoch) ))
+    if (( age > PGBR_MAX_BACKUP_AGE_HOURS * 3600 )); then
+      report CRIT "backup: newest is $last, $(( age / 3600 ))h old (limit ${PGBR_MAX_BACKUP_AGE_HOURS}h)"
+    else
+      report OK "backup: newest is $last ($(info_get "$last" type) from $(info_get "$last" source_node)), $(( age / 60 ))min old; $(ok_ids | wc -l) usable backup(s)"
+    fi
+  fi
+  local bad; bad=$(for id in $(all_ids); do [[ $(info_get "$id" status) == ok ]] || echo "$id"; done | tr '\n' ' ')
+  [[ -z $bad ]] || report CRIT "backup: not usable (failed verification): $bad"
+
+  # 3. WAL continuity along the newest timeline
+  local tli id oldest="" offl=""
+  tli=$(latest_tli)
+  for id in $(ok_ids); do
+    if backup_on_lineage "$id" "$tli"; then [[ -n $oldest ]] || oldest=$id; else offl+="$id "; fi
+  done
+  [[ -z $offl ]] || report OK "timeline: backups only restorable with an explicit older --target-timeline: $offl"
+  if [[ -n $oldest ]]; then
+    local gaps; GAP_COUNT=0
+    gaps=$(wal_gaps "$(lsn_segno "$(info_get "$oldest" start_lsn)")")
+    local cnt; cnt=$(grep -c . <<<"$gaps" || true)
+    if [[ $gaps == no-lineage ]]; then
+      report CRIT "wal: timeline history for timeline $tli is unreadable"
+    elif (( cnt > 0 )); then
+      report CRIT "wal: $cnt segment(s) MISSING on the path from backup $oldest to timeline $tli: $(head -n 5 <<<"$gaps" | tr '\n' ' ')$( (( cnt > 5 )) && echo ...)"
+    else
+      report OK "wal: continuous from backup $oldest to the newest archived segment on timeline $tli"
+    fi
+  fi
+
+  # 4. archive freshness + archiver state on the leader
+  local newest_file newest_age
+  newest_file=$(find "$WAL" -maxdepth 1 -name '*.zst' -printf '%T@ %f\n' 2>/dev/null | sort -n | tail -1)
+  if [[ -n $newest_file ]]; then
+    newest_age=$(( now - ${newest_file%%.*} ))
+    if (( newest_age > PGBR_MAX_ARCHIVE_AGE_SECONDS )); then
+      report CRIT "wal: nothing archived for ${newest_age}s (limit ${PGBR_MAX_ARCHIVE_AGE_SECONDS}s), last ${newest_file#* }"
+    else
+      report OK "wal: last segment archived ${newest_age}s ago (${newest_file#* })"
+    fi
+  else
+    report CRIT "wal: archive is empty"
+  fi
+  if [[ -n $LEADER_HOST ]]; then
+    local a
+    if a=$(sql "$LEADER_HOST" "$LEADER_PORT" "select failed_count||' '||coalesce(last_failed_wal,'-')||' '||(last_failed_time is not null and (last_archived_time is null or last_failed_time > last_archived_time))||' '||(select count(*) from pg_ls_archive_statusdir() where name like '%.ready') from pg_stat_archiver" 2>/dev/null); then
+      local fc fw failing ready; read -r fc fw failing ready <<<"$a"
+      if [[ $failing == t ]]; then report CRIT "archiver: currently FAILING on $fw (failed_count=$fc, $ready segment(s) waiting)"
+      elif (( ready > 4 )); then report WARN "archiver: $ready segment(s) waiting to be archived"
+      else report OK "archiver: healthy on the leader ($ready waiting, $fc failures since stats reset)"; fi
+    else
+      report WARN "archiver: could not query pg_stat_archiver on the leader"
+    fi
+  fi
+  local conflicts; conflicts=$(find "$STATE" -name 'wal-conflicts' -mmin -1440 2>/dev/null | head -1)
+  [[ -z $conflicts ]] || report CRIT "wal: conflicting segment(s) were pushed in the last 24h (possible split brain): $(tail -n 3 "$STATE/wal-conflicts" | tr '\n' ';')"
+
+  # 5. restore test
+  if [[ -s $STATE/last-restore-test ]]; then
+    local rt_epoch rt_res rt_id; read -r rt_epoch rt_res rt_id _ <"$STATE/last-restore-test"
+    if [[ $rt_res != ok ]]; then report CRIT "restore-test: last run FAILED (backup $rt_id)"
+    elif (( now - rt_epoch > PGBR_MAX_RESTORE_TEST_AGE_DAYS * 86400 )); then report WARN "restore-test: last success $(( (now - rt_epoch) / 86400 ))d ago"
+    else report OK "restore-test: last success $(( (now - rt_epoch) / 3600 ))h ago (backup $rt_id)"; fi
+  else
+    report WARN "restore-test: never run"
+  fi
+
+  (( CHECK_RC < 2 )) || alert "check found critical problems" "run: pgbr -c $PGBR_CLUSTER check"
+  return $CHECK_RC
+}
+
+# ----------------------------------------------------------------------------------------------
+# gateway: the only thing the PostgreSQL nodes' SSH key may run on this host
+# ----------------------------------------------------------------------------------------------
+gw_wal_push() { # name sha256 size   (segment on stdin)
+  local name=$1 sum=$2 size=$3
+  [[ $name =~ $WAL_ANY_RE ]] || die "wal-push: invalid WAL file name '$name'"
+  [[ $sum =~ ^[0-9a-f]{64}$ && $size =~ ^[0-9]+$ ]] || die "wal-push: invalid checksum/size"
+  local tmp; tmp=$(mktemp "$WAL/.tmp/$name.XXXXXX"); CLEANUP_PATHS+=("$tmp" "$tmp.zst")
+  cat >"$tmp"
+  local got; got=$(sha256sum <"$tmp"); got=${got%% *}
+  [[ $(stat -c %s "$tmp") == "$size" && $got == "$sum" ]] || die "wal-push: $name arrived truncated or corrupted"
+  if [[ $name =~ $WAL_SEG_RE ]]; then
+    (( size >= 1048576 && (size & (size - 1)) == 0 )) || die "wal-push: $name has an impossible segment size ($size)"
+  fi
+  local dest src=$tmp zst=1
+  [[ $name == *.history || $name == *.backup ]] && zst=0
+  if (( zst )); then dest="$WAL/$name.zst"; else dest="$WAL/$name"; fi
+  if (( zst )); then zstd -q -"$PGBR_WAL_COMPRESS_LEVEL" -c "$tmp" >"$tmp.zst"; src="$tmp.zst"; fi
+  sync "$src"
+  # ln is atomic and refuses to overwrite: first writer wins, everyone else gets compared.
+  if ln "$src" "$dest" 2>/dev/null; then
+    sync "$WAL"
+    return 0
+  fi
+  local have
+  if (( zst )); then have=$(zstd -dqc "$dest" | sha256sum); else have=$(sha256sum <"$dest"); fi
+  if [[ ${have%% *} == "$sum" ]]; then
+    return 0   # already archived with identical content: idempotent success
+  fi
+  printf '%s %s pushed-by=%s sha256=%s\n' "$(ts)" "$name" "$(cut -d' ' -f1 <<<"${SSH_CLIENT:-local}")" "$sum" >>"$STATE/wal-conflicts"
+  die "wal-push: CONFLICT - $name is already archived with different content (split brain or foreign cluster?)"
+}
+
+gw_wal_get() {
+  local name=$1
+  [[ $name =~ $WAL_ANY_RE ]] || die "wal-get: invalid WAL file name"
+  if [[ -f $WAL/$name.zst ]]; then zstd -dqc "$WAL/$name.zst"
+  elif [[ -f $WAL/$name ]]; then cat "$WAL/$name"
+  else exit 44   # not in the archive
+  fi
+}
+
+gw_wal_missing() { # names on stdin -> those not archived
+  local name
+  while read -r name; do
+    [[ $name =~ $WAL_ANY_RE ]] || continue
+    [[ -f $WAL/$name.zst || -f $WAL/$name ]] || echo "$name"
+  done
+}
+
+gw_backup_stream() {
+  local id=$1
+  [[ $id =~ $ID_RE ]] || die "backup-stream: invalid id"
+  chain_of "$id" >/dev/null || die "backup-stream: $id unusable"
+  if [[ $(info_get "$id" type) == full ]]; then
+    tar -C "$BASE/$id/data" -cf - . | zstd -q -T0 -1 -c
+  else
+    local tmp; tmp=$(mktemp -d "$SCRATCH/stream.XXXXXX"); CLEANUP_PATHS+=("$tmp")
+    materialize "$id" "$tmp/data"
+    tar -C "$tmp/data" -cf - . | zstd -q -T0 -1 -c
+  fi
+}
+
+cmd_gateway() {
+  local -a a=()
+  read -r -a a <<<"${SSH_ORIGINAL_COMMAND:-}"
+  local x
+  for x in "${a[@]:-}"; do [[ $x =~ ^[A-Za-z0-9_.:+=,/-]+$ ]] || die "gateway: illegal characters in request"; done
+  case ${a[0]:-} in
+    wal-push)      gw_wal_push "${a[1]:-}" "${a[2]:-}" "${a[3]:-}";;
+    wal-get)       gw_wal_get "${a[1]:-}";;
+    wal-missing)   gw_wal_missing;;
+    backup-select) select_backup "${a[@]:1}";;
+    backup-stream) gw_backup_stream "${a[1]:-}";;
+    backup-list)   cmd_list;;
+    *) die "gateway: unsupported request '${a[0]:-}'";;
+  esac
+}
+
+# ----------------------------------------------------------------------------------------------
+main() {
+  local cluster=""
+  while (( $# )); do
+    case $1 in
+      -c) cluster=$2; shift 2;;
+      -h|--help|help) usage; exit 0;;
+      *) break;;
+    esac
+  done
+  local cmd=${1:-}; [[ -n $cmd ]] || { usage; exit 1; }
+  shift
+  load_conf "$cluster"
+  case $cmd in
+    backup)       cmd_backup "$@";;
+    list)         cmd_list;;
+    verify)       cmd_verify "$@";;
+    expire)       cmd_expire "$@";;
+    restore)      cmd_restore "$@";;
+    restore-test) cmd_restore_test "$@";;
+    check)        cmd_check;;
+    wal-fetch)    LOGFILE=""; cmd_wal_fetch "$@";;
+    gateway)      cmd_gateway;;
+    *) usage; exit 1;;
+  esac
+}
+main "$@"

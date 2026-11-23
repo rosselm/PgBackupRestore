@@ -1,0 +1,8 @@
+[Unit]
+Description=pgbr restore drill for cluster %i (restore newest backup + archived WAL, amcheck)
+
+[Service]
+Type=oneshot
+User=postgres
+Nice=10
+ExecStart=/usr/local/bin/pgbr -c %i restore-test --amcheck

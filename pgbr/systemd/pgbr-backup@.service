@@ -1,0 +1,11 @@
+[Unit]
+Description=pgbr base backup of cluster %i (full or incremental, verified)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=postgres
+ExecStart=/usr/local/bin/pgbr -c %i backup --type auto
+# Retention only runs after a backup that succeeded and verified.
+ExecStartPost=/usr/local/bin/pgbr -c %i expire

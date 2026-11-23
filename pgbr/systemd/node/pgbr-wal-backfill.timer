@@ -1,0 +1,10 @@
+[Unit]
+Description=pgbr: retry the WAL backfill every 5 minutes (does nothing unless this node is the primary)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30
+
+[Install]
+WantedBy=timers.target

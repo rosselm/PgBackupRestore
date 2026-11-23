@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Closes the WAL archive gap a failover can leave behind.
+#
+# With archive_mode=on only the primary archives. If it dies before its archiver has shipped the
+# last completed segments, those segments never reach the repository: the promoted standby already
+# marked its streamed copies as ".done". The archive then has a hole exactly where a later PITR
+# across the failover needs to pass.
+#
+# The promoted node still holds those segments in pg_wal (wal_keep_size). This script, started by
+# the Patroni on_role_change callback, pushes every complete segment of an ancestor timeline that
+# lies strictly before the timeline switch and is not yet archived. Segments at or after the switch
+# point are never touched (the old-timeline file there is partial; PostgreSQL archives it itself as
+# ".partial"), and the repository refuses anything that differs from what it already has.
+. /usr/local/lib/pgbr/node-lib.sh
+: "${PGBR_PGDATA:?missing in node.conf}" "${PGBR_PGBIN:?missing in node.conf}"
+
+q() { "$PGBR_PGBIN/psql" -h "${PGBR_SOCKET_DIR:-/var/run/postgresql}" -p "${PGBR_PGPORT:-5432}" -d postgres -XAtq -c "$1" 2>/dev/null; }
+
+# Two callers:
+#   --wait   Patroni's on_role_change callback, right at promotion: wait until the node is writable.
+#   (none)   the pgbr-wal-backfill.timer on every node: exits at once unless this node is the primary.
+# The timer matters as much as the hook. The repository being unreachable is a likely reason for
+# the old primary's backlog in the first place, and then the hook cannot reach it either; the
+# segments stay in pg_wal (wal_keep_size), so a later run still closes the gap.
+if [[ ${1:-} == --wait ]]; then
+  for (( i = 0; i < 60; i++ )); do
+    [[ $(q "select pg_is_in_recovery()") == f ]] && break
+    sleep 2
+  done
+fi
+[[ $(q "select pg_is_in_recovery()") == f ]] || exit 0
+
+cur=$(q "select pg_walfile_name(pg_current_wal_lsn())")
+[[ $cur =~ ^[0-9A-F]{24}$ ]] || { nlog "could not determine the current WAL file"; exit 1; }
+tli_hex=${cur:0:8}
+(( 16#$tli_hex > 1 )) || exit 0          # timeline 1 has no ancestors
+hist="$PGBR_PGDATA/pg_wal/$tli_hex.history"
+[[ -f $hist ]] || exit 0
+segsz=$(q "select setting from pg_settings where name = 'wal_segment_size'")
+[[ $segsz =~ ^[0-9]+$ ]] || segsz=16777216
+per_id=$(( 0x100000000 / segsz ))
+
+cands=()
+while read -r ptli lsn _; do
+  [[ $ptli =~ ^[0-9]+$ && $lsn =~ ^[0-9A-Fa-f]+/[0-9A-Fa-f]+$ ]] || continue
+  switch_seg=$(( ((16#${lsn%/*} << 32) + 16#${lsn#*/}) / segsz ))
+  for f in "$PGBR_PGDATA/pg_wal/$(printf '%08X' "$ptli")"????????????????; do
+    name=${f##*/}
+    [[ $name =~ ^[0-9A-F]{24}$ ]] || continue
+    (( 16#${name:8:8} * per_id + 16#${name:16:8} < switch_seg )) || continue
+    [[ $(stat -c %s "$f") == "$segsz" ]] || continue
+    cands+=("$name")
+  done
+done <"$hist"
+
+(( ${#cands[@]} )) || exit 0
+
+missing=$(printf '%s\n' "${cands[@]}" | repo_ssh wal-missing) || { nlog "could not query the repository (will be retried by the timer)"; exit 1; }
+[[ -n $missing ]] || exit 0             # everything already archived: the normal, silent case
+
+rc=0
+for name in $missing; do
+  if /usr/local/bin/pgbr-archive-push "$PGBR_PGDATA/pg_wal/$name" "$name"; then
+    nlog "backfilled $name"
+  else
+    nlog "FAILED to backfill $name"; rc=1
+  fi
+done
+exit $rc

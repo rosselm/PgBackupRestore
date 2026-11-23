@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Patroni callback: postgresql.callbacks.on_role_change
+# Patroni calls it as: <script> <action> <role> <cluster-name>
+#
+# On promotion, backfill WAL the previous primary never archived. Patroni kills a callback that is
+# still running when the next one fires, so the work is detached and logged separately.
+action=${1:-}; role=${2:-}
+log_dir=/var/log/pgbr
+if [[ $action == on_role_change && ( $role == primary || $role == master || $role == standby_leader ) ]]; then
+  setsid nohup /usr/local/bin/pgbr-wal-backfill --wait >>"$log_dir/backfill.log" 2>&1 </dev/null &
+fi
+exit 0
