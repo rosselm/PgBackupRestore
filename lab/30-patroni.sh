@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs INSIDE a PG node as root. Installs the pgbr node scripts and writes the Patroni config.
+# Runs INSIDE a PG node as root. Installs the pgbr node side (pgbr/install/install-node.sh) and
+# writes the Patroni config.
 # Does not start Patroni (the caller starts the first node, waits for a leader, then the others).
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -8,30 +9,12 @@ me="$(hostname -s)"
 PGBIN="/usr/lib/postgresql/$PG_VERSION/bin"
 PGDATA="/var/lib/postgresql/$PG_VERSION/main"
 
-# --- pgbr node side ---------------------------------------------------------------------------
-install -d /usr/local/lib/pgbr /etc/pgbr
-install -m 644 ../pgbr/node/node-lib.sh /usr/local/lib/pgbr/node-lib.sh
-for s in pgbr-archive-push pgbr-archive-get pgbr-wal-backfill pgbr-patroni-callback pgbr-node-restore; do
-  install -m 755 "../pgbr/node/$s" "/usr/local/bin/$s"
-done
-install -d -o postgres -g postgres -m 750 /var/log/pgbr
-install -m 644 ../pgbr/systemd/node/pgbr-wal-backfill.service ../pgbr/systemd/node/pgbr-wal-backfill.timer /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now pgbr-wal-backfill.timer >/dev/null 2>&1
-cat > /etc/pgbr/node.conf <<EOF
-# pgbr node-side settings (sourced by the archive/restore scripts)
-PGBR_REPO_HOST=$BACKUP_HOST
-PGBR_REPO_USER=postgres
-PGBR_PGDATA=$PGDATA
-PGBR_PGBIN=$PGBIN
-PGBR_PGPORT=5432
-EOF
-
-# SSH identity the postgres user uses to reach the repository gateway
-install -d -o postgres -g postgres -m 700 /var/lib/postgresql/.ssh
-if [[ ! -f /var/lib/postgresql/.ssh/id_ed25519 ]]; then
-  sudo -u postgres ssh-keygen -q -t ed25519 -N '' -C "postgres@$me" -f /var/lib/postgresql/.ssh/id_ed25519
-fi
+# --- pgbr node side: the same installer a production node gets ---------------------------------
+# (--pgdata/--pgbin are explicit here because PostgreSQL does not exist yet at bootstrap time)
+bash ../pgbr/install/install-node.sh install --repo-host "$BACKUP_HOST" --pgdata "$PGDATA" --pgbin "$PGBIN" >/dev/null
+bash ../pgbr/install/install-node.sh enable-timer
+# Marks this machine as part of the lab; the destructive test scenarios refuse to run without it.
+echo "$CLUSTER_NAME" > /etc/pgbr/LAB
 
 # --- Patroni ----------------------------------------------------------------------------------
 etcd_hosts=""

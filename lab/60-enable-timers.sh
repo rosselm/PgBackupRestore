@@ -7,9 +7,7 @@ source ./lab.env
 
 orb -m "$BACKUP_HOST" sudo bash -c "
 set -e
-for t in backup check verify restore-test; do
-  systemctl enable --now pgbr-\$t@$CLUSTER_NAME.timer >/dev/null 2>&1
-done
+bash $PWD/../pgbr/install/install-repo.sh enable-timers --cluster $CLUSTER_NAME >/dev/null
 echo '== first run of each unit'
 for s in backup check; do
   systemctl start pgbr-\$s@$CLUSTER_NAME.service && echo \"pgbr-\$s@$CLUSTER_NAME.service: \$(systemctl show -p Result --value pgbr-\$s@$CLUSTER_NAME.service)\"

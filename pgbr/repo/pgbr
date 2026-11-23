@@ -124,11 +124,15 @@ WAL_ANY_RE='^([0-9A-F]{24}(\.partial)?|[0-9A-F]{8}\.history|[0-9A-F]{24}\.[0-9A-
 ID_RE='^[0-9]{8}T[0-9]{6}[FI]$'
 
 # Highest timeline known to the archive (what recovery_target_timeline=latest resolves to).
+# History files are the authority; archived segment names cover an archive that was started on a
+# cluster already past timeline 1 and has not seen a promotion yet (no history file archived).
 latest_tli() {
-  local max=1 f t
+  local max=1 f t newest
   for f in "$WAL"/*.history; do
     t=$(( 16#$(basename "$f" .history) )); (( t > max )) && max=$t
   done
+  newest=$(ls "$WAL" 2>/dev/null | grep -E '^[0-9A-F]{24}(\.partial)?\.zst$' | tail -1 || true)
+  if [[ -n $newest ]]; then t=$(( 16#${newest:0:8} )); (( t > max )) && max=$t; fi
   echo "$max"
 }
 
@@ -141,9 +145,9 @@ lineage() {
       [[ $ptli =~ ^[0-9]+$ && $lsn =~ ^[0-9A-Fa-f]+/[0-9A-Fa-f]+$ ]] || continue
       e=$(lsn_to_dec "$lsn"); echo "$ptli $prev $e"; prev=$e
     done <"$f"
-  elif (( tli != 1 )); then
-    return 1
   fi
+  # No history file: timeline 1, or an archive that begins on this timeline. Either way the
+  # repository knows no ancestors of it, and nothing in the repository can predate it.
   echo "$tli $prev 0"
 }
 
@@ -228,7 +232,8 @@ select_backup() {
 patroni_cluster() {
   local ep out
   for ep in $PGBR_PATRONI_ENDPOINTS; do
-    if out=$(curl -fsS --max-time "${PGBR_API_TIMEOUT:-5}" "$ep/cluster" 2>/dev/null) \
+    # shellcheck disable=SC2086
+    if out=$(curl -fsS ${PGBR_CURL_OPTS:-} --max-time "${PGBR_API_TIMEOUT:-5}" "$ep/cluster" 2>/dev/null) \
        && jq -e '.members | length > 0' >/dev/null 2>&1 <<<"$out"; then
       printf '%s' "$out"; return 0
     fi
@@ -361,6 +366,18 @@ size_bytes=$size
 verified_at=$(ts)
 EOF
   sync -f "$work/backup.info"
+  # A base backup carries the history file of its timeline. Make sure the archive has it too: an
+  # archive started on a cluster that is already past timeline 1 never received it, because
+  # PostgreSQL archives a history file only once, at the promotion that created it.
+  local h hn
+  for h in "$work"/data/pg_wal/*.history; do
+    hn=$(basename "$h")
+    if [[ $hn =~ ^[0-9A-F]{8}\.history$ && ! -e $WAL/$hn ]]; then
+      cp "$h" "$WAL/.tmp/$hn.$$" && sync "$WAL/.tmp/$hn.$$" && ln "$WAL/.tmp/$hn.$$" "$WAL/$hn" 2>/dev/null \
+        && log "backup $id: added $hn to the archive (taken from the backup)"
+      rm -f "$WAL/.tmp/$hn.$$"
+    fi
+  done
   mv "$work" "$BASE/$id"
   sync "$BASE"
   echo "$sysid" >"$STATE/system_id"
@@ -535,7 +552,14 @@ materialize() { # id dest  -> a complete data directory, synthesised from the fu
   local -a dirs=()
   for c in $chain; do dirs+=("$BASE/$c/data"); done
   log "restore: materialising $id from chain: $chain"
-  "$PGBR_PGBIN/pg_combinebackup" "${dirs[@]}" -o "$dest" >&2 || die "pg_combinebackup failed"
+  if [[ -x $PGBR_PGBIN/pg_combinebackup ]]; then
+    "$PGBR_PGBIN/pg_combinebackup" "${dirs[@]}" -o "$dest" >&2 || die "pg_combinebackup failed"
+  else
+    # PostgreSQL < 17 has neither incremental backups nor pg_combinebackup: a full is simply copied.
+    (( ${#dirs[@]} == 1 )) || die "backup $id is incremental but $PGBR_PGBIN has no pg_combinebackup"
+    mkdir -p "$dest" && cp -a "${dirs[0]}/." "$dest/" || die "copying the backup failed"
+    sync -f "$dest"
+  fi
   chmod 700 "$dest"
 }
 
@@ -787,14 +811,17 @@ cmd_check() {
   [[ -z $offl ]] || report OK "timeline: backups only restorable with an explicit older --target-timeline: $offl"
   if [[ -n $oldest ]]; then
     local gaps; GAP_COUNT=0
-    gaps=$(wal_gaps "$(lsn_segno "$(info_get "$oldest" start_lsn)")")
+    # Start at the segment holding the backup's END: everything before it travels inside the backup
+    # (-X stream). Its start may even predate the archive, when archiving was enabled on a running
+    # cluster and the replica's last restartpoint is older than that.
+    gaps=$(wal_gaps "$(lsn_segno "$(info_get "$oldest" stop_lsn)")")
     local cnt; cnt=$(grep -c . <<<"$gaps" || true)
     if [[ $gaps == no-lineage ]]; then
       report CRIT "wal: timeline history for timeline $tli is unreadable"
     elif (( cnt > 0 )); then
-      report CRIT "wal: $cnt segment(s) MISSING on the path from backup $oldest to timeline $tli: $(head -n 5 <<<"$gaps" | tr '\n' ' ')$( (( cnt > 5 )) && echo ...)"
+      report CRIT "wal: $cnt segment(s) MISSING on the path from the end of backup $oldest to timeline $tli: $(head -n 5 <<<"$gaps" | tr '\n' ' ')$( (( cnt > 5 )) && echo ...)"
     else
-      report OK "wal: continuous from backup $oldest to the newest archived segment on timeline $tli"
+      report OK "wal: continuous from the end of backup $oldest to the newest archived segment on timeline $tli"
     fi
   fi
 
@@ -802,7 +829,7 @@ cmd_check() {
   local newest_file newest_age
   newest_file=$(find "$WAL" -maxdepth 1 -name '*.zst' -printf '%T@ %f\n' 2>/dev/null | sort -n | tail -1)
   if [[ -n $newest_file ]]; then
-    newest_age=$(( now - ${newest_file%%.*} ))
+    newest_age=$(( now - ${newest_file%%.*} )); (( newest_age < 0 )) && newest_age=0
     if (( newest_age > PGBR_MAX_ARCHIVE_AGE_SECONDS )); then
       report CRIT "wal: nothing archived for ${newest_age}s (limit ${PGBR_MAX_ARCHIVE_AGE_SECONDS}s), last ${newest_file#* }"
     else

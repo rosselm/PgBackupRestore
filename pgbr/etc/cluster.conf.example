@@ -8,6 +8,7 @@ PGBR_PGBIN=/usr/lib/postgresql/17/bin      # same major version as the cluster
 # How the cluster is found. Any one reachable endpoint is enough; list them all.
 PGBR_PATRONI_ENDPOINTS="http://pg1:8008 http://pg2:8008 http://pg3:8008"
 PGBR_PGUSER=backup                         # REPLICATION + pg_monitor + pg_checkpoint; password in ~/.pgpass
+#PGBR_CURL_OPTS="--cacert /etc/pgbr/patroni-ca.pem"   # extra curl options if the REST API uses TLS (not tested in the lab)
 
 # --- where base backups are taken ---
 PGBR_BACKUP_FROM=prefer-replica            # replica | prefer-replica | primary

@@ -6,14 +6,15 @@ cluster (1 primary + 2 replicas)** using only native PostgreSQL tools: `pg_baseb
 
 * [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — what was built and why, trade-offs, what to change for production
 * [docs/TECHNICAL.md](docs/TECHNICAL.md) — how every piece works, configuration, runbooks, test results
+* [docs/PRODUCTION-ROLLOUT.md](docs/PRODUCTION-ROLLOUT.md) — adding this to an existing production cluster, phase by phase; what travels to production and what never does
 
 ## Layout
 
 | Directory | Contents |
 |---|---|
-| `pgbr/` | the tooling itself: `repo/pgbr` (backup host CLI), `node/` (archive, restore, backfill, in-place PITR scripts), `systemd/` (timers), `etc/` (config template). This is the part that travels to a real environment. |
-| `lab/` | builds the OrbStack lab: 3 PostgreSQL/Patroni/etcd machines + 1 backup host |
-| `tests/` | six failure and recovery scenarios that double as the acceptance test |
+| `pgbr/` | the tooling itself: `repo/pgbr` (backup host CLI), `node/` (archive, restore, backfill, in-place PITR scripts), `systemd/` (timers), `etc/` (config template), `install/` (preflight and the two installers). **The only part that goes to production.** |
+| `lab/` | builds the OrbStack lab: 3 PostgreSQL/Patroni/etcd machines + 1 backup host. **Lab only.** |
+| `tests/` | six failure and recovery scenarios that double as the acceptance test. **Lab only**: destructive, and guarded against running elsewhere. |
 | `docs/` | architecture and technical documentation |
 
 ## Quick start

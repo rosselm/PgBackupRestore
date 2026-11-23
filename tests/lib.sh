@@ -6,6 +6,19 @@ FIRST="${PG_NODES%% *}"
 REPO="/srv/pgbackup/$CLUSTER_NAME"
 PGBIN="/usr/lib/postgresql/$PG_VERSION/bin"
 
+# These scenarios kill primaries, drop tables and rewind whole clusters. They only talk to machines
+# through OrbStack, and on top of that insist on the marker the lab build leaves on its machines.
+lab_guard() {
+  command -v orb >/dev/null 2>&1 || { echo "tests: OrbStack (orb) not found - these scenarios only run against the lab" >&2; exit 1; }
+  local m
+  for m in $PG_NODES $BACKUP_HOST; do
+    [[ "$(orb list -q 2>/dev/null | grep -cx "$m")" == 1 ]] || { echo "tests: lab machine '$m' does not exist" >&2; exit 1; }
+  done
+  [[ "$(orb -m "$BACKUP_HOST" cat /etc/pgbr/LAB 2>/dev/null </dev/null)" == "$CLUSTER_NAME" ]] \
+    || { echo "tests: $BACKUP_HOST is not marked as lab '$CLUSTER_NAME' (/etc/pgbr/LAB): refusing to run destructive scenarios" >&2; exit 1; }
+}
+[[ ${PGBR_SKIP_LAB_GUARD:-0} == 1 ]] || lab_guard
+
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 pass() { printf '   \033[32mPASS\033[0m %s\n' "$*"; }
 fail() { printf '   \033[31mFAIL\033[0m %s\n' "$*"; exit 1; }

@@ -5,7 +5,8 @@ Native PostgreSQL tools only: `pg_basebackup`, `pg_verifybackup`, `pg_combinebac
 A thin layer of shell (`pgbr`) orchestrates them and makes them safe under Patroni.
 
 This document explains **what was built and why**. How each piece works in detail, the runbooks
-and the test evidence are in [TECHNICAL.md](TECHNICAL.md).
+and the test evidence are in [TECHNICAL.md](TECHNICAL.md). How to add it to an existing production
+cluster, step by step, is in [PRODUCTION-ROLLOUT.md](PRODUCTION-ROLLOUT.md).
 
 | | |
 |---|---|

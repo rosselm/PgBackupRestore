@@ -11,7 +11,7 @@
 #     failover, all starting from a backup taken BEFORE the failover
 source "$(dirname "$0")/lib.sh"
 SIDE="$REPO/scratch/pitr-failover"; PORT=5442
-KEY=/var/lib/postgresql/.ssh/id_ed25519
+KEY=/var/lib/postgresql/.ssh/pgbr_ed25519
 drop_side "$SIDE"
 
 OLD=$(leader)

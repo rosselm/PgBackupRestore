@@ -17,7 +17,7 @@ Contents
 10. [Things learned the hard way](#10-things-learned-the-hard-way)
 11. [Runbooks](#11-runbooks)
 12. [Operating the lab](#12-operating-the-lab)
-13. [Porting to the customer environment](#13-porting-to-the-customer-environment)
+13. [Rolling out on an existing production cluster](#13-rolling-out-on-an-existing-production-cluster)
 
 ---
 
@@ -63,7 +63,7 @@ number, not an impression.
 | `/etc/pgbr/node.conf` | repository host, `PGDATA`, binary directory |
 | `/etc/systemd/system/pgbr-wal-backfill.{service,timer}` | backfill retry every 5 minutes |
 | `/var/log/pgbr/backfill.log`, `pitr-postgres.log` | logs |
-| `~postgres/.ssh/id_ed25519` | key accepted only by the repository gateway |
+| `~postgres/.ssh/pgbr_ed25519` | dedicated key, accepted only by the repository gateway |
 | `/etc/patroni/config.yml` | Patroni configuration |
 
 ### On the backup host
@@ -77,7 +77,9 @@ number, not an impression.
 | `~postgres/.pgpass` | password of the `backup` role |
 | `~postgres/.ssh/authorized_keys` | node keys, each bound to `pgbr -c <cluster> gateway` |
 
-Source of all of it: `pgbr/` in this project (`repo/`, `node/`, `systemd/`, `etc/`).
+Source of all of it: `pgbr/` in this project (`repo/`, `node/`, `systemd/`, `etc/`), put in place by
+`pgbr/install/install-node.sh` and `pgbr/install/install-repo.sh`. The lab build calls the same two
+installers a production rollout uses ([PRODUCTION-ROLLOUT.md](PRODUCTION-ROLLOUT.md)).
 Everything on the backup host runs as the OS user `postgres`.
 
 ## 3. Configuration
@@ -248,10 +250,17 @@ because Patroni kills callbacks that outlive the next one), and `pgbr-wal-backfi
 ### 5.4 Continuity check
 
 `pgbr check` computes, from the newest history file in the archive, the lineage
-`(timeline, begin LSN, end LSN)…`. For every segment number between the start of the oldest usable
+`(timeline, begin LSN, end LSN)…`. For every segment number between the **end** of the oldest usable
 backup and the newest archived segment it derives the one file a recovery would read (the
 highest timeline in the lineage that had begun by then) and tests that it exists. Missing files
 are listed; the check goes critical.
+
+It starts at the backup's end, not its start, because a backup carries the WAL of its own duration
+(`-X stream`), and its start can legitimately predate the archive: when archiving is switched on
+for a running cluster, the first backup begins at the replica's last restartpoint, which is older.
+If the archive has no history file for the newest timeline (an archive started on a cluster that
+was already past timeline 1 and has not promoted since), the newest timeline is taken from the
+archived segment names, and the first backup copies its history file into the archive.
 
 ## 6. Base backups in detail
 
@@ -377,7 +386,7 @@ On every node: `pgbr-wal-backfill.timer`, every 5 minutes.
 OK    patroni: leader=pg1 timeline=11 members=pg1:leader:running,pg2:replica:streaming,pg3:replica:streaming
 OK    backup: newest is 20261123T144346I (incr from pg2), 0min old; 5 usable backup(s)
 OK    timeline: backups only restorable with an explicit older --target-timeline: 20261123T143900I
-OK    wal: continuous from backup 20261123T143813F to the newest archived segment on timeline 11
+OK    wal: continuous from the end of backup 20261123T143813F to the newest archived segment on timeline 11
 OK    wal: last segment archived 10s ago (0000000B0000000000000035.zst)
 OK    archiver: healthy on the leader (0 waiting, 0 failures since stats reset)
 OK    restore-test: last success 0h ago (backup 20261123T144034F)
@@ -387,7 +396,7 @@ OK    restore-test: last success 0h ago (backup 20261123T144034F)
 |---|---|---|
 | patroni | no endpoint answers, or no running leader | |
 | backup | none, or newest older than `PGBR_MAX_BACKUP_AGE_HOURS`; any backup marked `corrupt` | |
-| wal continuity | any segment missing on the path from the oldest usable backup | |
+| wal continuity | any segment missing on the path from the end of the oldest usable backup | |
 | wal freshness | nothing archived for `PGBR_MAX_ARCHIVE_AGE_SECONDS` | |
 | archiver | `pg_stat_archiver` shows the last attempt failed | more than 4 segments waiting |
 | conflicts | a conflicting push was recorded in the last 24 h | |
@@ -406,6 +415,9 @@ runs them in order (about 7 minutes). All of this happened on 2026-11-23.
 * After the last code change the whole suite was run again in one uninterrupted pass:
   **6 scenarios, 57 assertions, 0 failures**, taking the cluster from timeline 12 to 18. The
   unedited output of that run is in [test-run-2026-11-23.log](test-run-2026-11-23.log).
+* The suite was run once more after the production rollout had been rehearsed on the lab
+  (PRODUCTION-ROLLOUT.md §11), against the cluster as that rollout left it: again 57 assertions,
+  0 failures ([test-run-after-rollout-2026-11-23.log](test-run-after-rollout-2026-11-23.log)).
 * The first attempt at that final pass failed in scenario 2, and the cause was the test, not the
   cluster: it slept a fixed 15 seconds after the failover and counted old lines in the backfill
   log, while that particular promotion needed 24 seconds to accept writes (§10.6). The scenario
@@ -708,6 +720,7 @@ lab/lab-up.sh                 # build everything from nothing (idempotent)
 tests/run-all.sh              # all six scenarios, about 7 minutes
 tests/measure-promotion.sh    # A/B: summarize_wal on/off across planned switchovers (about 25 minutes)
 tests/measure-failover.sh     # A/B: the same across hard failovers (about 30 minutes)
+lab/rehearse-rollout.sh off|placeholder   # strip the lab, then rehearse the production rollout
 lab/pitr-cluster.sh --target-time <ISO8601> [--pause]
 lab/05-hosts.sh               # re-pin host names if machine IPs changed after a restart
 lab/lab-destroy.sh            # delete the four machines
@@ -725,9 +738,9 @@ Build order, if you want to run or adapt the steps one at a time:
 | `05-hosts.sh` | Mac | pins host names in `/etc/hosts` everywhere |
 | `10-packages.sh node\|backup` | in each machine | PGDG repository, PostgreSQL, Patroni, etcd, tools |
 | `20-etcd.sh` | in each node | etcd member configuration |
-| `30-patroni.sh` | in each node | pgbr node scripts, backfill timer, `patroni.yml`, SSH key |
-| `40-backup-host.sh` | in `pgbackup` | `pgbr`, its config, the repository, unit files |
-| `45-ssh-trust.sh` | Mac | node keys → gateway-only `authorized_keys`; verifies the restriction |
+| `30-patroni.sh` | in each node | `install-node.sh` (pgbr node side, key, backfill timer), `patroni.yml` |
+| `40-backup-host.sh` | in `pgbackup` | `install-repo.sh` (`pgbr`, its config, the repository, unit files) |
+| `45-ssh-trust.sh` | Mac | node keys → gateway-only `authorized_keys`, host key pinned, restriction verified (via the installers) |
 | `50-start-cluster.sh` | Mac | starts Patroni, creates the `backup` role and demo schema |
 | `55-workload.sh` | Mac | heartbeat workload service |
 | `60-enable-timers.sh` | Mac | enables the timers and runs backup + check once |
@@ -735,28 +748,27 @@ Build order, if you want to run or adapt the steps one at a time:
 Versions and names are in `lab/lab.env`. The machines `debian` and `ubuntu` that already existed in
 OrbStack are not part of the lab and were not touched.
 
-## 13. Porting to the customer environment
+## 13. Rolling out on an existing production cluster
 
-What to copy: the `pgbr/` directory. What to adapt:
+This has its own document: **[PRODUCTION-ROLLOUT.md](PRODUCTION-ROLLOUT.md)**. It separates what
+travels to production (`pgbr/`) from what never does (`lab/`, `tests/`), starts with a read-only
+preflight on every node, and then goes phase by phase with the impact, the verification and the
+undo of each step. The procedure was rehearsed twice against the lab (`lab/rehearse-rollout.sh`):
+from `archive_mode = on` with a placeholder command (no restart, no write interruption) and from
+`archive_mode = off` (rolling restart, one 4.2 s write interruption at the switchover).
 
-* **Paths.** `PGBR_PGBIN` and `PGBR_PGDATA`. On RHEL-family systems with PGDG packages these are
-  `/usr/pgsql-17/bin` and `/var/lib/pgsql/17/data`, and `PGBR_SOCKET_DIR` is usually
-  `/var/run/postgresql` as well; check `unix_socket_directories`.
-* **PostgreSQL version.** 17+ for incrementals; otherwise `PGBR_INCREMENTAL=0` and remove
-  `summarize_wal` / `wal_summary_keep_time` from the Patroni configuration.
-* **Patroni configuration.** Add the settings of §3.1 with `patronictl edit-config` (changing
-  `archive_mode` needs a restart of each member; Patroni flags it as pending) and the callback of
-  §3.2 in each node's `patroni.yml` (reload).
-* **`pg_hba.conf`** (through Patroni): a `replication` entry and a `postgres` database entry for
-  the `backup` role from the backup host.
-* **The `backup` role**: `CREATE ROLE backup LOGIN REPLICATION PASSWORD …; GRANT pg_monitor,
-  pg_checkpoint TO backup; GRANT EXECUTE ON FUNCTION pg_switch_wal() TO backup;`
-* **SSH**: one key per node for `postgres`, installed on the backup host with
-  `restrict,command="/usr/local/bin/pgbr -c <cluster> gateway"`.
-* **Sizing**: repository space ≈ fulls kept × database size + incrementals + WAL of the window
-  (compressed) + scratch space of one database size for drills and combined restores;
-  `wal_keep_size` on the nodes for the repository outage you want to ride out.
-* **Tablespaces**, if used, need work first (ARCHITECTURE §7).
+Short version of what differs from the lab:
 
-Before trusting it there: run the six scenarios against a non-production copy of the real topology.
-They are the acceptance test.
+* **Paths and users** are detected by the installers or passed to them; nothing is hard-coded to
+  the Debian layout.
+* **PostgreSQL version.** 17+ for incrementals; otherwise `PGBR_INCREMENTAL=0` and no
+  `summarize_wal`. Only 17 was tested.
+* **Existing settings** (`archive_command`, `restore_command`, callbacks, where `pg_hba` lives)
+  are discovered by `pgbr/install/preflight.sh` and decided on before anything is changed.
+* **Sizing**: repository space of fulls kept x database size + incrementals + WAL of the window
+  (compressed) + scratch space of one database size; `wal_keep_size` on the nodes for the
+  repository outage you want to ride out.
+* **Tablespaces** are not supported (ARCHITECTURE §7).
+
+The six scenarios in `tests/` are the acceptance test for a non-production copy of the real
+topology. They are destructive and guarded against running anywhere but the lab.
